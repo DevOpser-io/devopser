@@ -78,24 +78,10 @@ module.exports = (sequelize) => {
       epoch = Math.floor(Date.now() / 1000);
     }
     
-    // Following the DevOpser portal CICD approach:
-    // 1. Use a window of 2 (±1 minute total) for verification
-    // 2. Log the expected token for debugging
-    
-    // Generate the expected token for debugging
-    const expectedToken = speakeasy.totp({
-      secret: this.mfaSecret,
-      encoding: 'base32',
-      algorithm: 'sha1',
-      digits: 6,
-      period: 30,
-      time: epoch  // Use time parameter as in DevOpser portal
-    });
-    
-    console.log(`Verifying TOTP at epoch=${epoch}`);
-    console.log(`Expected TOTP: ${expectedToken}`);
-    console.log(`Received token: ${cleanToken}`);
-    
+    // Never compute or log the expected token or the received token: both are
+    // valid one-time credentials and logging them would leak them. Rely on the
+    // verification library and log only the boolean result below.
+
     // Verify with a window of 4 (±2 minutes) for 120 seconds expiration
     const verified = speakeasy.totp.verify({
       encoding: 'base32',

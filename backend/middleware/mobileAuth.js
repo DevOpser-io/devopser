@@ -47,23 +47,53 @@ async function getMobileSecrets() {
 
 /**
  * Generate a default API key (for development only)
+ *
+ * Fails closed in production: never fall back to a hardcoded/guessable key.
+ * In non-production, generate a random per-process value so the fallback can
+ * never be a shipped literal that an attacker could know in advance.
  */
 function generateDefaultApiKey() {
-  // Use fixed development key that matches mobile app
-  const key = 'dev_mobile_api_key_change_in_production';
-  console.warn(`⚠️  Using development API key for mobile: ${key}`);
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('MOBILE_API_KEY is not configured; refusing to use a default API key in production');
+  }
+  const key = crypto.randomBytes(32).toString('hex');
+  console.warn('⚠️  Using generated per-process API key for mobile (development only)');
   console.warn('⚠️  Set MOBILE_API_KEY in AWS Secrets Manager for production!');
   return key;
 }
 
 /**
  * Generate a default signing secret (for development only)
+ *
+ * Fails closed in production: never fall back to a per-process secret that
+ * would silently pass signature validation without an operator-set value.
  */
 function generateDefaultSigningSecret() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('MOBILE_SIGNING_SECRET is not configured; refusing to use a default signing secret in production');
+  }
   const secret = crypto.randomBytes(64).toString('hex');
-  console.warn('⚠️  Using generated signing secret for mobile');
+  console.warn('⚠️  Using generated per-process signing secret for mobile (development only)');
   console.warn('⚠️  Set MOBILE_SIGNING_SECRET in AWS Secrets Manager for production!');
   return secret;
+}
+
+/**
+ * Constant-time string comparison to avoid leaking the API key via timing.
+ * Returns false immediately on a length mismatch (which is not secret), and
+ * otherwise compares the full buffers so the timing does not depend on the
+ * position of the first differing byte.
+ */
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
@@ -147,7 +177,7 @@ function mobileAuth(options = {}) {
       // Get and validate API key
       const secrets = await getMobileSecrets();
 
-      if (apiKey !== secrets.apiKey) {
+      if (!timingSafeEqualStr(apiKey, secrets.apiKey)) {
         console.warn(`[Mobile Auth] Invalid API key attempt: ${apiKey.substring(0, 8)}...`);
         return res.status(401).json({
           error: 'Invalid API key',

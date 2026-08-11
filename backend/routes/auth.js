@@ -86,7 +86,7 @@ router.post('/magic-link/request', [
 
     // Generate random 6-digit code
     const code = crypto.randomInt(100000, 999999).toString();
-    console.log(`[Magic Link] Generated new code for ${email}: ${code}`);
+    console.log(`[Magic Link] Generated new code for ${email}`);
 
     // Clean up any old "used" keys for this email to prevent conflicts
     const oldUsedPattern = `magic_link_used:${email}:*`;
@@ -104,8 +104,8 @@ router.post('/magic-link/request', [
     // Set rate limit
     await redisClient.client.setEx(rateLimitKey, 60, Date.now().toString());
 
-    // Get base URL for verification link
-    const baseUrl = getFullUrl(req, '');
+    // Get base URL for verification link (config-derived, never request headers)
+    const baseUrl = canonicalBaseUrl();
     const verificationUrl = `${baseUrl}/auth/magic-link/auto-verify?email=${encodeURIComponent(email)}&code=${code}`;
 
     // Send email with code
@@ -231,7 +231,7 @@ router.post('/magic-link/verify', [
     }
 
     const { email, code, name } = req.body;
-    console.log(`[Magic Link] Verification attempt for ${email} with code: ${code}`);
+    console.log(`[Magic Link] Verification attempt for ${email}`);
 
     // Retrieve code from Redis
     const codeKey = `magic_link_code:${email}`;
@@ -246,7 +246,7 @@ router.post('/magic-link/verify', [
     }
 
     if (storedCode !== code) {
-      console.log(`[Magic Link] Code mismatch for ${email}. Expected: ${storedCode}, Got: ${code}`);
+      console.log(`[Magic Link] Code mismatch for ${email}`);
       return res.status(401).json({
         success: false,
         error: 'Incorrect code. Please try again.'
@@ -258,7 +258,7 @@ router.post('/magic-link/verify', [
     const wasUsed = await redisClient.client.get(usedKey);
 
     if (wasUsed) {
-      console.log(`[Magic Link] Code ${code} for ${email} was already used (key: ${usedKey})`);
+      console.log(`[Magic Link] Code for ${email} was already used`);
       return res.status(401).json({
         success: false,
         error: 'This verification code has already been used. Please request a new code.'
@@ -267,7 +267,7 @@ router.post('/magic-link/verify', [
 
     // Mark code as used (keep for 5 minutes to prevent reuse)
     await redisClient.client.setEx(usedKey, 300, '1');
-    console.log(`[Magic Link] Marked code ${code} as used for ${email}`);
+    console.log(`[Magic Link] Marked code as used for ${email}`);
 
     // Delete the original code now that it's marked as used
     await redisClient.client.del(codeKey);
@@ -335,11 +335,17 @@ router.post('/magic-link/verify', [
   }
 });
 
-// GET /auth/magic-link/auto-verify - Auto-verify and login from email link
+// GET /auth/magic-link/auto-verify - Render a same-origin confirmation page.
+// SECURITY (login CSRF): a bare top-level GET that establishes a session is
+// login CSRF under SameSite=Lax. An attacker could force a victim's browser to
+// follow a link and silently sign them into the attacker's account (or use the
+// victim's own emailed link to pin their session). So this GET NEVER logs anyone
+// in and has NO side effects on the stored code: it only renders a confirmation
+// page carrying a one-time, session-bound nonce. The login is completed by the
+// POST handler below, which requires that nonce and rejects cross-site requests.
 router.get('/magic-link/auto-verify', async (req, res) => {
   // CRITICAL: Don't process HEAD requests - these are pre-flight checks from email clients
   // Email clients (Outlook, Gmail, etc.) send HEAD requests to verify links before the user clicks
-  // If we process these, the code gets consumed before the user actually clicks the link
   if (req.method === 'HEAD') {
     return res.status(200).end();
   }
@@ -354,18 +360,7 @@ router.get('/magic-link/auto-verify', async (req, res) => {
     }
 
     // Normalize email
-    const normalizedEmail = email.toLowerCase().trim();
-
-    // If user is already logged in as a different account, log them out first
-    if (req.isAuthenticated() && req.user && req.user.email !== normalizedEmail) {
-      console.log(`User ${req.user.email} is trying to use a magic link for ${normalizedEmail}. Logging them out first.`);
-      await new Promise((resolve) => {
-        req.logout((err) => {
-          if (err) console.error('Logout error:', err);
-          resolve();
-        });
-      });
-    }
+    const normalizedEmail = String(email).toLowerCase().trim();
 
     // If user is already logged in as the same account, just redirect to landing
     if (req.isAuthenticated() && req.user && req.user.email === normalizedEmail) {
@@ -374,10 +369,109 @@ router.get('/magic-link/auto-verify', async (req, res) => {
     }
 
     // Validate code format
-    if (code.length !== 6 || !/^\d{6}$/.test(code)) {
+    if (typeof code !== 'string' || code.length !== 6 || !/^\d{6}$/.test(code)) {
       req.flash('error', 'Invalid verification code format.');
       return res.redirect('/auth/login');
     }
+
+    // Bind a one-time nonce to this session. The code is neither validated nor
+    // consumed here, so email-client prefetches cannot burn it.
+    const nonce = crypto.randomBytes(32).toString('hex');
+    req.session.magicLinkConfirm = {
+      nonce,
+      email: normalizedEmail,
+      code,
+      createdAt: Date.now()
+    };
+
+    // Persist the nonce before rendering the confirmation page.
+    return req.session.save((saveErr) => {
+      if (saveErr) {
+        console.error('[Magic Link] Session save error before confirmation page:', saveErr);
+        req.flash('error', 'An error occurred. Please try again.');
+        return res.redirect('/auth/login');
+      }
+
+      const safeEmail = escapeHtml(normalizedEmail);
+      const safeNonce = escapeHtml(nonce);
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      return res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="same-origin">
+  <title>Confirm sign-in</title>
+  <style>
+    body { margin: 0; padding: 0; background: #f4f4f4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .card { max-width: 440px; margin: 60px auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }
+    .card h1 { background: #446df6; color: #fff; margin: 0; padding: 24px 30px; font-size: 20px; }
+    .card .body { padding: 30px; color: #333; }
+    .card p { color: #555; font-size: 15px; line-height: 22px; margin: 0 0 8px 0; }
+    .card button { margin-top: 12px; padding: 14px 32px; border: 0; border-radius: 6px; background: #446df6; color: #fff; font-size: 16px; font-weight: 500; cursor: pointer; }
+    .card .email { font-weight: 600; color: #333; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Confirm sign-in</h1>
+    <div class="body">
+      <p>Click the button below to finish signing in as <span class="email">${safeEmail}</span>.</p>
+      <form method="POST" action="/auth/magic-link/auto-verify">
+        <input type="hidden" name="nonce" value="${safeNonce}">
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>`);
+    });
+
+  } catch (error) {
+    console.error('Magic link auto-verify error:', error);
+    req.flash('error', 'An error occurred. Please try again.');
+    return res.redirect('/auth/login');
+  }
+});
+
+// POST /auth/magic-link/auto-verify - Complete the login started by the GET
+// confirmation page. This is the ONLY place the emailed code is consumed and the
+// session established. It requires the session-bound nonce and rejects cross-site
+// submissions, which together defeat login CSRF under SameSite=Lax.
+router.post('/magic-link/auto-verify', async (req, res) => {
+  try {
+    // Reject cross-site form submissions where the browser tells us the origin.
+    const secFetchSite = req.headers['sec-fetch-site'];
+    if (secFetchSite === 'cross-site') {
+      console.warn('[Magic Link] Rejected cross-site auto-verify POST');
+      req.flash('error', 'Sign-in request could not be verified. Please try again.');
+      return res.redirect('/auth/login');
+    }
+
+    const confirm = req.session.magicLinkConfirm;
+    if (!confirm || !confirm.nonce || !confirm.email || !confirm.code) {
+      req.flash('error', 'Sign-in session expired. Please request a new code.');
+      return res.redirect('/auth/login');
+    }
+
+    // Validate the one-time nonce in constant time, then consume it.
+    const submittedNonce = typeof req.body.nonce === 'string' ? req.body.nonce : '';
+    const expectedNonce = confirm.nonce;
+    const nonceOk =
+      submittedNonce.length === expectedNonce.length &&
+      crypto.timingSafeEqual(Buffer.from(submittedNonce), Buffer.from(expectedNonce));
+
+    // One-time use: clear regardless of the match outcome.
+    delete req.session.magicLinkConfirm;
+
+    if (!nonceOk) {
+      console.warn('[Magic Link] Rejected auto-verify POST with invalid nonce');
+      req.flash('error', 'Sign-in request could not be verified. Please try again.');
+      return res.redirect('/auth/login');
+    }
+
+    const normalizedEmail = confirm.email;
+    const code = confirm.code;
 
     // Retrieve code from Redis
     const codeKey = `magic_link_code:${normalizedEmail}`;
@@ -464,7 +558,7 @@ router.get('/magic-link/auto-verify', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Magic link auto-verify error:', error);
+    console.error('Magic link auto-verify (POST) error:', error);
     req.flash('error', 'An error occurred. Please try again.');
     return res.redirect('/auth/login');
   }
@@ -484,24 +578,82 @@ router.get('/signup', (req, res) => {
 const { sendEmail } = require('../services/emailService');
 
 /**
- * Generate a full URL based on the current request and path
- * This mimics Flask's url_for with _external=True by using the request's protocol and host
- * @param {Object} req - Express request object
+ * Compute the canonical base URL for this deployment WITHOUT reading any
+ * request headers. Trusting x-forwarded-host / host / hostname from the request
+ * let an attacker inject an arbitrary host into emailed magic links, so the
+ * sign-in code could be delivered to a link pointing at a host they control
+ * (account takeover). We therefore derive the base URL solely from trusted
+ * server configuration and fail closed in production if none is set.
+ * @returns {String} - Base URL including protocol and host, no trailing slash
+ */
+function canonicalBaseUrl() {
+  if (process.env.SITE_BASE_URL) {
+    return process.env.SITE_BASE_URL.replace(/\/+$/, '');
+  }
+  if (process.env.CUSTOM_DOMAIN) {
+    return 'https://' + process.env.CUSTOM_DOMAIN.split(',')[0].trim();
+  }
+  // Fail closed: never guess a host (or fall back to localhost) in production.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('canonicalBaseUrl: SITE_BASE_URL or CUSTOM_DOMAIN must be set in production');
+  }
+  return `http://localhost:${process.env.PORT || 8000}`;
+}
+
+/**
+ * Generate a full URL for the given path. Thin wrapper kept so existing call
+ * sites keep working, but it NEVER trusts request headers: the host always
+ * comes from canonicalBaseUrl(). The req argument is retained only for
+ * signature compatibility and is intentionally ignored.
+ * @param {Object} req - Express request object (unused)
  * @param {String} path - URL path (should start with /)
  * @returns {String} - Full URL including protocol and host
  */
 function getFullUrl(req, path) {
-  // Get protocol (http or https)
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  return url.resolve(canonicalBaseUrl() + '/', path);
+}
 
-  // Get host from headers (includes port if specified)
-  const host = req.headers['x-forwarded-host'] || req.headers.host || req.hostname || 'localhost:8000';
+/**
+ * Validate an untrusted returnTo value so it can only ever redirect within this
+ * origin. Accepts same-origin absolute paths only; rejects absolute URLs,
+ * protocol-relative URLs ('//evil.com'), backslash bypasses ('/\\evil.com'),
+ * and control characters. Returns the safe path or null.
+ * @param {*} candidate - Untrusted value (typically req.query.returnTo)
+ * @returns {String|null}
+ */
+function safeReturnTo(candidate) {
+  if (typeof candidate !== 'string' || candidate.length === 0) {
+    return null;
+  }
+  // Must be a same-origin absolute path.
+  if (candidate[0] !== '/') {
+    return null;
+  }
+  // Reject protocol-relative ('//host') and backslash-based bypasses.
+  if (candidate[1] === '/' || candidate[1] === '\\') {
+    return null;
+  }
+  // Reject control characters (newlines, tabs, NUL, etc.).
+  if (/[\x00-\x1f\x7f]/.test(candidate)) {
+    return null;
+  }
+  return candidate;
+}
 
-  // Combine to form the base URL
-  const baseUrl = `${protocol}://${host}`;
-
-  // Join with the path
-  return url.resolve(baseUrl, path);
+/**
+ * Minimal HTML-attribute escaper for values interpolated into the magic-link
+ * confirmation page. Prevents the email/code query values from breaking out of
+ * the hidden input attributes.
+ * @param {*} value
+ * @returns {String}
+ */
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // GET /auth/mfa-setup - Display MFA setup page
@@ -521,10 +673,10 @@ router.get('/mfa-setup', async (req, res, next) => {
     if (!user.mfaSecret) {
       user.generateMfaSecret();
       await user.save();
-      console.log('Generated new MFA secret for setup:', user.mfaSecret);
+      console.log('Generated new MFA secret for setup for user id:', user.id);
     }
     const otpauthUrl = user.getMfaUri();
-    console.log('Generated otpauth URL:', otpauthUrl);
+    console.log('Generated otpauth URL for user id:', user.id);
     
     // Generate QR code with specific options to prevent double scanning
     const qr = await qrcode.toDataURL(otpauthUrl, {
@@ -582,7 +734,7 @@ router.post('/mfa-setup', async (req, res, next) => {
       }
     }
     
-    console.log('Verifying TOTP with secret:', user.mfaSecret);
+    console.log('Verifying TOTP for user id:', user.id);
     const isValid = user.verifyTotp(verification_code);
     console.log('TOTP verification result:', isValid);
     
@@ -1127,9 +1279,11 @@ router.get('/google', (req, res, next) => {
     return res.redirect('/auth/login');
   }
 
-  // Store return URL if provided
-  if (req.query.returnTo) {
-    req.session.returnTo = req.query.returnTo;
+  // Store return URL if provided (same-origin paths only, to prevent an
+  // attacker-controlled returnTo from turning login into an open redirect)
+  const safeReturn = safeReturnTo(req.query.returnTo);
+  if (safeReturn) {
+    req.session.returnTo = safeReturn;
   }
 
   // Detect mobile flag
@@ -1141,24 +1295,12 @@ router.get('/google', (req, res, next) => {
     console.log('[OAuth] Mobile flag set in session:', req.session.id);
   }
 
-  // Create state parameter with mobile flag and other metadata
-  const stateData = {
-    mobile: isMobile,
-    timestamp: Date.now(),
-    sessionId: req.sessionID
-  };
-  const state = Buffer.from(JSON.stringify(stateData)).toString('base64');
-  console.log('[OAuth] Created state parameter with mobile flag:', isMobile);
-
-  // Store backup in Redis with state as key
-  const stateKey = `oauth_state:${state}`;
-  redisClient.client.setEx(stateKey, 600, JSON.stringify({ mobile: isMobile }))
-    .then(() => {
-      console.log('[OAuth] Stored state backup in Redis');
-    })
-    .catch(err => {
-      console.error('[OAuth] Error storing state in Redis:', err);
-    });
+  // NOTE: We intentionally do NOT build a custom `state` string here.
+  // passport-oauth2 only runs its CSRF state store when `state: true` is set on
+  // the strategy (done in server.js) AND no explicit state string is passed. A
+  // custom state string is used verbatim and SKIPS the store, defeating the
+  // login-CSRF protection. The mobile flag is carried via the session and the
+  // callback query (?mobile=true) instead.
 
   // Dynamically generate callback URL with mobile flag if present
   let dynamicCallbackURL = getFullUrl(req, '/auth/google/callback');
@@ -1174,11 +1316,10 @@ router.get('/google', (req, res, next) => {
     }
     console.log('[OAuth] Session saved before redirect, mobile flag:', req.session.mobileAuth);
 
-    // Initiate Google OAuth flow with dynamic callback URL and state parameter
+    // Initiate Google OAuth flow. passport generates and verifies its own state.
     passport.authenticate('google', {
       scope: ['profile', 'email'],
-      callbackURL: dynamicCallbackURL,
-      state: state
+      callbackURL: dynamicCallbackURL
     })(req, res, next);
   });
 });
@@ -1191,52 +1332,25 @@ router.get('/google/callback', async (req, res, next) => {
     return res.redirect('/auth/login');
   }
 
-  // Detect mobile flag from multiple sources (in priority order)
-  let isMobileFromState = false;
-  let isMobileFromRedis = false;
+  // Detect mobile flag from the callback query, callback URL, and session.
+  // The `state` parameter is owned and verified by passport-oauth2 and no
+  // longer carries any application data, so we do NOT decode it here.
 
-  // 1. Check state parameter (highest priority)
-  if (req.query.state) {
-    try {
-      const decodedState = Buffer.from(req.query.state, 'base64').toString('utf-8');
-      const stateData = JSON.parse(decodedState);
-      isMobileFromState = stateData.mobile === true;
-      console.log('[OAuth] State parameter decoded, mobile flag:', isMobileFromState);
-
-      // Also check Redis backup for this state
-      const stateKey = `oauth_state:${req.query.state}`;
-      try {
-        const redisStateStr = await redisClient.client.get(stateKey);
-        if (redisStateStr) {
-          const redisState = JSON.parse(redisStateStr);
-          isMobileFromRedis = redisState.mobile === true;
-          console.log('[OAuth] Redis state backup found, mobile flag:', isMobileFromRedis);
-          // Clean up Redis state
-          await redisClient.client.del(stateKey);
-        }
-      } catch (redisErr) {
-        console.error('[OAuth] Error checking Redis state:', redisErr);
-      }
-    } catch (e) {
-      console.error('[OAuth] Error decoding state parameter:', e);
-    }
-  }
-
-  // 2. Check query parameter
+  // 1. Check query parameter
   const isMobileFromQuery = req.query.mobile === 'true';
   console.log('[OAuth] Query parameter mobile flag:', isMobileFromQuery);
 
-  // 3. Check session (lowest priority, often lost)
+  // 2. Check session (may be lost across the OAuth round trip)
   const isMobileFromSession = req.session.mobileAuth === true;
   console.log('[OAuth] Session mobile flag:', isMobileFromSession);
 
-  // 4. Check callback URL itself
+  // 3. Check callback URL itself
   const callbackURL = req.originalUrl || req.url;
   const isMobileFromURL = callbackURL.includes('mobile=true');
   console.log('[OAuth] Callback URL contains mobile=true:', isMobileFromURL);
 
-  // Determine final mobile auth flag (priority: state > Redis > query > URL > session)
-  const isMobileAuth = isMobileFromState || isMobileFromRedis || isMobileFromQuery || isMobileFromURL || isMobileFromSession;
+  // Determine final mobile auth flag (priority: query > URL > session)
+  const isMobileAuth = isMobileFromQuery || isMobileFromURL || isMobileFromSession;
   console.log('[OAuth] Final mobile auth decision:', isMobileAuth);
 
   // Dynamically generate the callback URL to match what was used during authorization

@@ -184,8 +184,8 @@ async function initializeSequelize() {
       // If environment variables aren't set, try to get secrets from AWS Secrets Manager
       console.log('Retrieving database credentials from AWS Secrets Manager');
       
-      // Force development mode if we're running locally and not in a container
-      if (!process.env.KUBERNETES_SERVICE_HOST) {
+      // Select the local dev DB by authoritative NODE_ENV, not the orchestrator var.
+      if (process.env.NODE_ENV !== 'production') {
         console.log('DATABASE INIT: Detected local environment, forcing development mode');
         // Use development configuration instead of trying to access AWS Secrets Manager
         return new Sequelize(

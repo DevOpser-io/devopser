@@ -32,11 +32,10 @@ async function createAdminUser() {
     let user = await db.User.findOne({ where: { email } });
     
     if (user) {
-      // Update existing user to be admin
-      user.isAdmin = true;
-      await user.setPassword(password);
-      await user.save();
-      console.log(`User ${email} updated and set as admin`);
+      // Create-only: do NOT re-grant admin or reset the password for an
+      // existing user. Overwriting on every boot would reverse a deliberate
+      // admin revocation and clobber a rotated password.
+      console.log(`User ${email} already exists; leaving isAdmin and password unchanged`);
     } else {
       // Create new admin user
       user = await db.User.create({

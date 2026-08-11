@@ -73,16 +73,12 @@ async function configureSession(app, secret) {
       saveUninitialized: true, // Changed to true to ensure session is created on first visit
       rolling: true, // Force a cookie set on every response to extend the session lifetime
       proxy: process.env.NODE_ENV === 'production', // Trust the reverse proxy when in production
-      // Prevent session ID regeneration during login flow
+      // Always generate a fresh session ID. Reusing req.sessionID would defeat
+      // Passport's regenerate-at-login and enable session fixation. Do not log
+      // the ID (it is a bearer credential).
       genid: function(req) {
-        if (req.sessionID) {
-          console.log(`Preserving existing session ID: ${req.sessionID}`);
-          return req.sessionID;
-        }
         const { v4: uuidv4 } = require('uuid');
-        const sessionId = uuidv4();
-        console.log(`Generated new session ID: ${sessionId}`);
-        return sessionId;
+        return uuidv4();
       },
       cookie: {
         secure: config.session.cookie.secure,

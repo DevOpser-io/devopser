@@ -45,9 +45,10 @@ const dbConfig = {
   }
 };
 
-// Force development mode if we're running locally and not in a container
-if (!process.env.KUBERNETES_SERVICE_HOST && process.env.NODE_ENV === 'production') {
-  console.log('CONFIG: Detected local environment, forcing development mode');
+// NODE_ENV is authoritative. Only downgrade from production when an explicit
+// opt-in flag is set (never inferred from the orchestrator var).
+if (process.env.NODE_ENV === 'production' && process.env.ALLOW_LOCAL_PRODUCTION_OVERRIDE === 'true') {
+  console.warn('CONFIG: ALLOW_LOCAL_PRODUCTION_OVERRIDE=true, downgrading NODE_ENV to development');
   process.env.NODE_ENV = 'development';
 }
 
@@ -77,6 +78,22 @@ if (process.env.NODE_ENV === 'production') {
       console.error('Error loading database credentials from AWS Secrets Manager:', error);
     }
   })();
+}
+
+// Resolve the session secret, failing closed rather than using a published default.
+function resolveSessionSecret() {
+  if (process.env.SESSION_SECRET) {
+    return process.env.SESSION_SECRET;
+  }
+  // In deployments the secret is delivered via Secrets Manager and resolved in server.js.
+  if (process.env.SESSION_SECRET_NAME) {
+    return null;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET (or SESSION_SECRET_NAME) must be set in production');
+  }
+  console.warn('SESSION_SECRET not set, generating a per-process random secret for development');
+  return require('crypto').randomBytes(32).toString('hex');
 }
 
 module.exports = {
@@ -144,7 +161,8 @@ Format titles and major sections with headers even in narrative content, but kee
 
   // Session settings
   session: {
-    secret: process.env.SESSION_SECRET || 'bedrock-express-default-secret',
+    secret: resolveSessionSecret(),
+    secretName: process.env.SESSION_SECRET_NAME || null,
     cookieName: process.env.NODE_ENV === 'production' ? '__Host-session' : 'bedrock-express.sid',
     cookie: {
       maxAge: parseInt(process.env.SESSION_MAX_AGE || (24 * 60 * 60 * 1000)), // 1 day default

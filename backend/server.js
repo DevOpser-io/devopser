@@ -319,7 +319,10 @@ app.use((err, req, res, next) => {
         passport.use(new GoogleStrategy({
           clientID: googleClientId,
           clientSecret: googleClientSecret,
-          callbackURL: "/auth/google/callback" // Default fallback, will be overridden dynamically
+          callbackURL: "/auth/google/callback", // Default fallback, will be overridden dynamically
+          // Use passport-oauth2's session-backed state store (instead of the
+          // default NullStore, which never validates) to prevent login CSRF.
+          state: true
         },
         async (accessToken, refreshToken, profile, done) => {
           try {
@@ -394,16 +397,20 @@ app.use((err, req, res, next) => {
     app.use(passport.session());
     app.use(flash());
 
-    // Debug logging for authentication and MFA status
-    app.use((req, res, next) => {
-      console.log(`${req.method} ${req.path} | Auth: ${req.isAuthenticated ? req.isAuthenticated() : false} | MFA: ${req.session?.mfaVerified || false} | Session ID: ${req.session?.id || 'none'}`);
-      
-      // Add cookie debug info for troubleshooting
-      const cookies = req.headers.cookie || 'none';
-      console.log(`Request cookies: ${cookies}`);
-      
-      next();
-    });
+    // Debug logging for authentication and MFA status.
+    // Only installed outside production: the Cookie header and the raw session
+    // ID are bearer credentials and must never be logged. We log a
+    // non-reversible fingerprint of the session ID instead.
+    if (process.env.NODE_ENV !== 'production') {
+      app.use((req, res, next) => {
+        const sessionId = req.session?.id;
+        const sessionFingerprint = sessionId
+          ? crypto.createHash('sha256').update(sessionId).digest('hex').slice(0, 12)
+          : 'none';
+        console.log(`${req.method} ${req.path} | Auth: ${req.isAuthenticated ? req.isAuthenticated() : false} | MFA: ${req.session?.mfaVerified || false} | Session fingerprint: ${sessionFingerprint}`);
+        next();
+      });
+    }
 
     // Global authentication check middleware
     app.use((req, res, next) => {

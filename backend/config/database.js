@@ -10,9 +10,10 @@ const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client
 // Log the current environment
 console.log('==================================================');
 
-// Force development mode if we're running locally and not in a container
-if (!process.env.KUBERNETES_SERVICE_HOST && process.env.NODE_ENV === 'production') {
-  console.log('DATABASE CONFIG: Detected local environment, forcing development mode');
+// NODE_ENV is authoritative. Only downgrade from production when an explicit
+// opt-in flag is set (never inferred from the orchestrator var).
+if (process.env.NODE_ENV === 'production' && process.env.ALLOW_LOCAL_PRODUCTION_OVERRIDE === 'true') {
+  console.warn('DATABASE CONFIG: ALLOW_LOCAL_PRODUCTION_OVERRIDE=true, downgrading NODE_ENV to development');
   process.env.NODE_ENV = 'development';
 }
 

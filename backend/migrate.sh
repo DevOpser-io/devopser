@@ -16,9 +16,12 @@ if [ ! -f "./config/database.js" ]; then
   echo "Contents: $(ls -la)"
 fi
 
-# Print environment variables (excluding secrets)
+# Print environment variables (explicit allowlist of non-sensitive vars only)
+# A name-substring filter is not redaction: values under lowercase keys leak.
 echo "=== Environment Variables ==="
-env | grep -v -E 'SECRET|PASSWORD|KEY'
+for v in NODE_ENV REGION DB_HOST DB_PORT DB_NAME PORT; do
+  printf '%s=%s\n' "$v" "$(printenv "$v")"
+done
 
 # Check if required environment variables are set
 if [ -z "$REGION" ]; then
