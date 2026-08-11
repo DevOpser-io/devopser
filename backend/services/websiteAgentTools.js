@@ -1008,7 +1008,7 @@ Your response is rendered through a Markdown parser (marked + DOMPurify) on both
   NOT: \`✅ Hero Section - headline and CTA ✅ Features - 6 items\`.
 - Do not prefix bullets with check marks, arrows, sparkles, or any other symbol — a plain \`-\` is the bullet.
 - Keep replies under ~6 short bullets unless the user asked for detail.
-\`;
+`;
 
   return prompt;
 }
