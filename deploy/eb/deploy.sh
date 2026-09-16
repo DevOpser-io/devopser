@@ -10,6 +10,8 @@ set -euo pipefail
 APP_NAME="${APP_NAME:-devopser-demo}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="${STACK_NAME:-${APP_NAME}-stack}"
+# AWS Partner Revenue Measurement code; every resource gets aws-apn-id=pc:<code>.
+DEVOPSER_APN_PRODUCT_CODE="${DEVOPSER_APN_PRODUCT_CODE:-6ydf4kme1p7fqu1vp1wy1uxoc}"
 TEMPLATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${TEMPLATE_DIR}/../.." && pwd)"
 
@@ -58,6 +60,8 @@ aws cloudformation deploy \
       CreateEBEnvironment=false \
       DBPasswordParam="${DBPasswordParam}" \
       SessionSecretParam="${SessionSecretParam}" \
+      DevOpserApnProductCode="${DEVOPSER_APN_PRODUCT_CODE}" \
+  --tags aws-apn-id="pc:${DEVOPSER_APN_PRODUCT_CODE}" \
   --no-fail-on-empty-changeset
 
 ECR_URI=$(aws cloudformation describe-stacks \
@@ -136,6 +140,8 @@ aws cloudformation deploy \
       SourceBundleBucket="${BUNDLE_BUCKET}" \
       SourceBundleKey="${BUNDLE_KEY}" \
       VersionLabel="${VERSION_LABEL}" \
+      DevOpserApnProductCode="${DEVOPSER_APN_PRODUCT_CODE}" \
+  --tags aws-apn-id="pc:${DEVOPSER_APN_PRODUCT_CODE}" \
   --no-fail-on-empty-changeset
 
 EB_URL=$(aws cloudformation describe-stacks \
