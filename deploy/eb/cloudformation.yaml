@@ -68,6 +68,16 @@ Parameters:
       EB platform version. `aws elasticbeanstalk list-available-solution-stacks`
       lists current names if this becomes stale.
 
+  DevOpserApnProductCode:
+    Type: String
+    Default: 6ydf4kme1p7fqu1vp1wy1uxoc
+    AllowedPattern: "^[a-z0-9]+$"
+    Description: >
+      AWS Partner Revenue Measurement product code for the DevOpser Marketplace
+      listing. Every resource in this stack is tagged aws-apn-id=pc:<code> so
+      AWS can attribute the usage to DevOpser; it does not change your bill.
+      Keep the default unless AWS gives you a different code.
+
 Conditions:
   WithEBEnv: !Equals [ !Ref CreateEBEnvironment, "true" ]
 
@@ -87,12 +97,12 @@ Resources:
       CidrBlock: 10.60.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-vpc" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-vpc" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   Igw:
     Type: AWS::EC2::InternetGateway
     Properties:
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-igw" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-igw" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   IgwAttach:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -104,7 +114,7 @@ Resources:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-rt" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-rt" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PublicDefaultRoute:
     Type: AWS::EC2::Route
@@ -121,7 +131,7 @@ Resources:
       CidrBlock: !FindInMap [ Subnets, PublicA, Cidr ]
       AvailabilityZone: !FindInMap [ Subnets, PublicA, Az ]
       MapPublicIpOnLaunch: true
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-a" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-a" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PublicSubnetB:
     Type: AWS::EC2::Subnet
@@ -130,7 +140,7 @@ Resources:
       CidrBlock: !FindInMap [ Subnets, PublicB, Cidr ]
       AvailabilityZone: !FindInMap [ Subnets, PublicB, Az ]
       MapPublicIpOnLaunch: true
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-b" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-b" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PublicSubnetAAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -144,7 +154,7 @@ Resources:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-rt" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-rt" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PrivateSubnetA:
     Type: AWS::EC2::Subnet
@@ -152,7 +162,7 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: !FindInMap [ Subnets, PrivateA, Cidr ]
       AvailabilityZone: !FindInMap [ Subnets, PrivateA, Az ]
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-a" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-a" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PrivateSubnetB:
     Type: AWS::EC2::Subnet
@@ -160,7 +170,7 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: !FindInMap [ Subnets, PrivateB, Cidr ]
       AvailabilityZone: !FindInMap [ Subnets, PrivateB, Az ]
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-b" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-b" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   PrivateSubnetAAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -179,14 +189,14 @@ Resources:
       SecurityGroupIngress:
         - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 0.0.0.0/0 }
         - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, CidrIp: 0.0.0.0/0 }
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-app" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-app" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   SgDb:
     Type: AWS::EC2::SecurityGroup
     Properties:
       VpcId: !Ref Vpc
       GroupDescription: RDS PostgreSQL - only EB can reach it
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-db" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-db" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   SgDbFromApp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -202,7 +212,7 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       GroupDescription: ElastiCache Redis - only EB can reach it
-      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-redis" } ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-redis" }, { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" } ]
 
   SgRedisFromApp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -219,6 +229,8 @@ Resources:
     Properties:
       DBSubnetGroupDescription: !Sub "${AppName} RDS subnet group"
       SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   Database:
     Type: AWS::RDS::DBInstance
@@ -241,6 +253,9 @@ Resources:
       BackupRetentionPeriod: 7
       DeletionProtection: false
       MultiAZ: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   # ---------- ElastiCache Redis ----------
   RedisSubnetGroup:
@@ -248,6 +263,8 @@ Resources:
     Properties:
       Description: !Sub "${AppName} Redis subnet group"
       SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   RedisCluster:
     Type: AWS::ElastiCache::CacheCluster
@@ -259,6 +276,8 @@ Resources:
       NumCacheNodes: 1
       CacheSubnetGroupName: !Ref RedisSubnetGroup
       VpcSecurityGroupIds: [ !Ref SgRedis ]
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   # ---------- Secrets Manager (five entries for the *_SECRET_NAME pattern) ----------
   # The template's backend/migrate.sh and config/database.js look up each of
@@ -268,30 +287,40 @@ Resources:
     Properties:
       Name: !Sub "${AppName}/db/name"
       SecretString: devopser
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   SecretDbUser:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "${AppName}/db/user"
       SecretString: devopser
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   SecretDbPassword:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "${AppName}/db/password"
       SecretString: !Ref DBPasswordParam
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   SecretDbHost:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "${AppName}/db/host"
       SecretString: !GetAtt Database.Endpoint.Address
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   SecretDbPort:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub "${AppName}/db/port"
       SecretString: !GetAtt Database.Endpoint.Port
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   # ---------- ECR ----------
   EcrRepo:
@@ -302,6 +331,8 @@ Resources:
       RepositoryName: !Ref AppName
       EmptyOnDelete: true
       ImageScanningConfiguration: { ScanOnPush: true }
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   # ---------- IAM: EB EC2 instance profile ----------
   InstanceRole:
@@ -342,6 +373,8 @@ Resources:
                   - secretsmanager:DescribeSecret
                 Resource:
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/*"
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -362,6 +395,8 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
         - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
   # ---------- Elastic Beanstalk ----------
   EbApp:
@@ -437,6 +472,8 @@ Resources:
         # Log streaming to CloudWatch
         - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: StreamLogs, Value: "true" }
         - { Namespace: "aws:elasticbeanstalk:cloudwatch:logs", OptionName: RetentionInDays, Value: "14" }
+      Tags:
+        - { Key: aws-apn-id, Value: !Sub "pc:${DevOpserApnProductCode}" }
 
 Outputs:
   AppName:

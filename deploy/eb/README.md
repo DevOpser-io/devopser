@@ -21,6 +21,15 @@ At the end the script prints the `*.elasticbeanstalk.com` URL.
 | `APP_NAME` | `devopser-demo` | Stack, ECR repo, SM prefix, EB app name |
 | `AWS_REGION` | `us-east-1` | Must match Bedrock region |
 | `STACK_NAME` | `${APP_NAME}-stack` | CloudFormation stack name |
+| `DEVOPSER_APN_PRODUCT_CODE` | `6ydf4kme1p7fqu1vp1wy1uxoc` | AWS Partner attribution code (see below) |
+
+### Attribution tag
+
+Every resource the stack creates carries `aws-apn-id=pc:<DEVOPSER_APN_PRODUCT_CODE>`
+(AWS Partner Revenue Measurement). It lets AWS attribute the usage of this free
+template to the DevOpser Marketplace listing; it adds nothing to your bill and
+grants DevOpser no access to your account. Change the value only if AWS gives
+you a different code.
 
 ## Subsequent deploys
 
