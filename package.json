@@ -34,7 +34,7 @@
     "@capacitor/preferences": "^5.0.8",
     "@capacitor/splash-screen": "^5.0.8",
     "dotenv-cli": "^8.0.0",
-    "express": "^4.21.2",
+    "express": "^4.22.2",
     "http-proxy-middleware": "^3.0.5",
     "sequelize-cli": "^6.6.3"
   },
@@ -43,6 +43,6 @@
     "minimatch": "^9.0.7",
     "brace-expansion": "^2.0.3",
     "picomatch": "^2.3.2",
-    "@xmldom/xmldom": "^0.8.12"
+    "@xmldom/xmldom": "^0.8.13"
   }
 }

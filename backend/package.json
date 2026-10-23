@@ -17,9 +17,9 @@
     "@aws-sdk/client-sts": "^3.787.0",
     "@aws-sdk/credential-providers": "^3.817.0",
     "@aws-sdk/s3-request-presigner": "^3.966.0",
-    "@anthropic-ai/sdk": "^0.88.0",
+    "@anthropic-ai/sdk": "^0.91.1",
     "@hapi/sntp": "^4.0.0",
-    "axios": "^1.15.0",
+    "axios": "^1.15.2",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
     "connect-flash": "^0.1.1",
@@ -50,7 +50,7 @@
     "redis": "^4.6.13",
     "sequelize": "^6.37.8",
     "speakeasy": "^2.0.0",
-    "uuid": "^11.1.0"
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1",
@@ -65,7 +65,7 @@
     "path-to-regexp": "^0.1.13",
     "picomatch": "^2.3.2",
     "dottie": "^2.0.7",
-    "qs": "^6.14.2",
+    "qs": "^6.15.2",
     "cookie": "^0.7.0",
     "underscore": "^1.13.8",
     "@xmldom/xmldom": "^0.8.12"
