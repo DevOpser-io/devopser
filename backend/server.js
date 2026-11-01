@@ -147,6 +147,13 @@ app.use(helmet({
   frameguard: { action: 'deny' } // Prevent clickjacking
 }));
 
+// Helmet does not set Permissions-Policy. Deny the powerful browser features
+// the template never uses, so injected script cannot reach them either.
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), sync-xhr=(), usb=(), xr-spatial-tracking=()');
+  next();
+});
+
 // Middleware to restrict mobile-app.html access - only allow on org-specific ALB DNS or localhost
 // The mobile app HTML is for native app development/testing only, not for production web access
 app.use((req, res, next) => {
