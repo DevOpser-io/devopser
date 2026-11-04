@@ -6,7 +6,7 @@
 #           PR.IP-1 (Baseline configuration)
 #           PR.PT-3 (Least functionality principle)
 
-FROM node:18-alpine AS builder
+FROM node:24.22.1-alpine AS builder
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ COPY package*.json ./
 RUN npm ci --only=production && npm cache clean --force
 
 # Production image
-FROM node:18-alpine
+FROM node:24.22.1-alpine
 
 # Security: Create non-root user
 RUN addgroup -g 1001 -S appgroup && \

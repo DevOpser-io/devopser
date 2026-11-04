@@ -7,7 +7,7 @@
 # Managed hosting on app.devopser.io uses its own image/build pipeline and
 # will replace this file during integration — keep it simple here.
 
-FROM node:23-slim
+FROM node:24.22.1-slim
 
 WORKDIR /app
 
