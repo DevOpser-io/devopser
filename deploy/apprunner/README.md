@@ -46,7 +46,7 @@ sender on the first deploy or nobody can log in. See "Transactional email".
 | `DASH0_OTLP_URL` | `""` (telemetry off) | Dash0 OTLP/HTTP ingress, e.g. `https://ingress.<region>.aws.dash0.com`. Environment first, then the repo `.env` |
 | `DASH0_AUTH_TOKEN` | `""` | Dash0 token with Ingesting permission. Stored in Secrets Manager as `${APP_NAME}/otel/otlp-headers`, never a template parameter. An `op://` reference is resolved with `op read` or refused |
 | `DASH0_DATASET` | `default` | Dataset the telemetry, the SLO and the deployment event all use. Must be the same for all three |
-| `DEMO_FAULT_ERROR_RATE` | `0` | SLO demo only. Share (0 to 1) of non-health requests the app answers with 500 (`backend/middleware/demoFault.js`). Deploy with it set to stage an incident, re-run without it to stage the fix |
+| `DEMO_FAULT_ERROR_RATE` | `0` | SLO demo only. Share (0 to 1) of non-health requests the app answers with 500 (`backend/middleware/demoFault.js`). Deploy with it set to stage an incident, re-run without it to stage the fix; each run leaves its own deployment marker |
 | `DEMO_FAULT_LATENCY_RATE` / `DEMO_FAULT_LATENCY_MS` | `0` / `900` | SLO demo only. Share of non-health requests delayed, and by how much |
 | `DEVOPSER_APN_PRODUCT_CODE` | same as `deploy/eb` | AWS Partner attribution tag `aws-apn-id=pc:<code>` on the stack |
 
@@ -125,6 +125,7 @@ The deployed workload gets these variables (all set by the template, none by han
 
 - **Identity** is `slo-demo/slo-demo` (`service.namespace/service.name`) with `service.version=<image tag>`. Every trace, log, the deployment event and the SLO use the same strings.
 - **SLO:** `slo/slo-demo-availability.slo.yaml` is the availability objective on that identity, scoped to `deployment_environment_name="production"` so laptop traffic never burns the budget. Apply it once, or after changing it, with `op run --env-file=.env -- ./scripts/apply-slo.sh` (needs `DASH0_API_URL`, the `api.` host, and a token with All permissions). Idempotent (`PUT /api/slos/<origin>`).
+- **Deployment marker:** every `deploy.sh` run ends by sending one `dash0.deployment` event, `succeeded` or `failed`, from an EXIT trap through `scripts/dash0-deployment-event.sh` (curl only). It shows on the SLO's error-budget and burn-rate charts only when `service.name`, `service.namespace` and the dataset equal the telemetry's, which the script guarantees by taking them from the same variables. Confirm after a deploy: open the SLO (Alerting > SLOs), or filter Logs on `otel.event.name = dash0.deployment`.
 - **Local run** with the same identity in the `local` environment: `op run --env-file=.env -- npm run start:otel`, then `op run --env-file=.env -- ./scripts/verify-telemetry.sh` to send traffic and prove arrival.
 
 ## Subsequent deploys

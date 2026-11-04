@@ -121,7 +121,7 @@ Parameters:
       (backend/middleware/demoFault.js). 0, the default, disables it.
       deploy.sh passes DEMO_FAULT_ERROR_RATE from its environment: deploy
       with a value to stage an incident, deploy again without it to stage
-      the fix.
+      the fix. Both deploys emit a dash0.deployment marker.
 
   DemoFaultLatencyRate:
     Type: String
