@@ -6,7 +6,8 @@
 #      domain> and SiteBaseUrlParam=https://<that domain> (or $SITE_BASE_URL)
 # Idempotent. Re-run to deploy a new version of the code. When telemetry to
 # Dash0 is configured (DASH0_OTLP_URL + DASH0_AUTH_TOKEN, environment first,
-# repo .env second), the service is deployed instrumented.
+# repo .env second), the service is deployed instrumented and every run ends
+# by sending one dash0.deployment event, succeeded or failed.
 #
 # Pre-reqs: working AWS creds (aws sts get-caller-identity succeeds),
 # docker daemon running, curl.
@@ -210,6 +211,45 @@ log "pushing image ${VERSION_LABEL}"
 docker push "${ECR_URI}:${VERSION_LABEL}"
 docker push "${ECR_URI}:latest"
 
+# ---------- deployment marker (dash0.deployment event) ----------
+# One event per deploy, sent from the EXIT trap after the deploy has
+# finished, succeeded or failed, so it lands as a marker on the SLO's
+# error-budget and burn-rate charts. service.name / service.namespace /
+# service.version / dataset are the same variables the workload gets above
+# (OTEL_SERVICE_NAME=AppName, service.namespace=AppName, service.version=
+# ImageTag); a mismatch means no marker, silently. App Runner blocks until
+# the new revision serves traffic, so "after the deploy" is after the CFN
+# update returns. Only sent when telemetry is configured; never fatal.
+DEPLOY_STARTED=0
+DEPLOY_EVENT_SENT=0
+send_deploy_event() {
+  local status="$1"
+  [[ "${DEPLOY_EVENT_SENT}" == 0 ]] || return 0
+  DEPLOY_EVENT_SENT=1
+  [[ -n "${DASH0_OTLP_URL:-}" && -n "${DASH0_AUTH_TOKEN:-}" ]] || return 0
+  local repo_url; repo_url=$(git -C "${REPO_ROOT}" remote get-url origin 2>/dev/null \
+    | sed -E 's#^git@([^:]+):#https://\1/#; s#\.git$##' || true)
+  log "sending dash0.deployment event (${status})"
+  DASH0_OTLP_URL="${DASH0_OTLP_URL}" DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN}" \
+  DASH0_DATASET="${OTEL_DATASET}" \
+    "${REPO_ROOT}/scripts/dash0-deployment-event.sh" \
+      --service-name "${APP_NAME}" --service-namespace "${APP_NAME}" \
+      --service-version "${VERSION_LABEL}" --environment production \
+      --status "${status}" \
+      --deployment-name apprunner-deploy --deployment-id "${VERSION_LABEL}" \
+      --vcs-url "${repo_url}" \
+      --vcs-revision "$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)" \
+      --vcs-ref "$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" \
+    || log "warning: dash0.deployment event not sent (non-fatal)"
+}
+on_exit() {
+  local rc=$?
+  if [[ "${DEPLOY_STARTED}" == 1 ]]; then
+    if [[ "${rc}" -eq 0 ]]; then send_deploy_event succeeded; else send_deploy_event failed; fi
+  fi
+  exit "${rc}"
+}
+trap on_exit EXIT
 
 # ---------- phase 2: App Runner service ----------
 log "phase 2/3 - deploying App Runner service (~5 min; CFN waits for RUNNING)"
@@ -220,6 +260,7 @@ log "phase 2/3 - deploying App Runner service (~5 min; CFN waits for RUNNING)"
 if [[ "${DEMO_FAULT_ERROR_RATE:-0}" != 0 || "${DEMO_FAULT_LATENCY_RATE:-0}" != 0 ]]; then
   log "DEMO FAULT ACTIVE for this release: error rate ${DEMO_FAULT_ERROR_RATE:-0}, latency rate ${DEMO_FAULT_LATENCY_RATE:-0} (+${DEMO_FAULT_LATENCY_MS:-900} ms)"
 fi
+DEPLOY_STARTED=1
 aws cloudformation deploy \
   --region "${AWS_REGION}" \
   --stack-name "${STACK_NAME}" \
