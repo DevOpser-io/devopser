@@ -1,0 +1,19 @@
+# App Runner wrapper around the repo-root Dockerfile.
+#
+# The root image can't be used as-is because (a) backend/migrate.sh shells
+# out to the `aws` CLI to fetch DB secrets, which the base image doesn't
+# ship, and (b) the base CMD boots the server directly without running
+# migrations. This wrapper adds awscli + curl and swaps in an entrypoint
+# that migrates before boot. Build it with:
+#   --build-arg BASE_IMAGE=<image built from the repo-root Dockerfile>
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+COPY deploy/apprunner/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    apt-get update && apt-get install -y --no-install-recommends awscli curl && \
+    rm -rf /var/lib/apt/lists/*
+
+USER node
+CMD ["/app/entrypoint.sh"]

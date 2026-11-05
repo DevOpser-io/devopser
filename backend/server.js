@@ -196,6 +196,10 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Deliberate fault injection for SLO demos. Inert unless DEMO_FAULT_* is set
+// (see middleware/demoFault.js); registered after /health so health stays green.
+app.use(require('./middleware/demoFault')());
+
 // Index route moved to async initialization function after session is configured
 
 // Error handling

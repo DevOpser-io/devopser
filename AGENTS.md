@@ -110,7 +110,7 @@ Do not report "setup complete" until the curl returns 200 **and** you've checked
 After the app is running, the human will usually want one or more of:
 
 - **Their actual product** — ask what they're building, then reshape routes/models/UI (see the extension points section below)
-- **A deployment target** — pick one and wire it into `backend/routes/sites.js → triggerDeployment()` (see the deployment section). A working single-tenant reference implementation for **AWS Elastic Beanstalk** already exists at [`deploy/eb/`](deploy/eb/README.md) — if the human asks for EB, read `deploy/eb/README.md` first and extend from there; do NOT write new CloudFormation from scratch.
+- **A deployment target** — pick one and wire it into `backend/routes/sites.js → triggerDeployment()` (see the deployment section). Working single-tenant reference implementations already exist for **AWS Elastic Beanstalk** at [`deploy/eb/`](deploy/eb/README.md) and **AWS App Runner** at [`deploy/apprunner/`](deploy/apprunner/README.md) — if the human asks for either, read that module's README first and extend from there; do NOT write new CloudFormation from scratch.
 - **Billing** — Stripe / Paddle / usage metering
 - **Real email** — fill in `MAIL_*` in `.env` with Gmail app password or SES config
 
@@ -357,6 +357,8 @@ router.get('/sensitive', ensureFullAuth, (req, res) => {
 
 > **If the human asks for AWS Elastic Beanstalk specifically, stop and read [`deploy/eb/README.md`](deploy/eb/README.md) first.** A working single-tenant reference implementation is already committed there (CloudFormation + deploy script + Dockerfile.eb + entrypoint). It stands up its own VPC, RDS PostgreSQL, ElastiCache Redis, ECR repo, instance IAM role with `bedrock:InvokeModel`, and Secrets Manager entries for DB creds. Extend or customize that module; do not re-derive it from scratch.
 
+> **If the human asks for AWS App Runner, read [`deploy/apprunner/README.md`](deploy/apprunner/README.md) first.** Same shape as the EB module (CloudFormation + three-phase deploy script + Dockerfile.apprunner + entrypoint + delete script), but the service runs on App Runner behind a VPC connector with interface endpoints for Secrets Manager, STS and Bedrock, no NAT by default, in-stack generated secrets, and an SES sender for the email-only sign-in. Extend that module; do not re-derive it.
+
 The `Publish` button in the website builder currently hits a stub that marks every deployment as `not_configured`. Your job when a human asks for "deploy this to X" is to:
 
 1. **Pick the target** based on what the human has and how they want to bill/tenant it.
@@ -370,6 +372,7 @@ The `Publish` button in the website builder currently hits a stub that marks eve
 | Target | When to pick it |
 |---|---|
 | **AWS Elastic Beanstalk (single-instance Docker)** | **Reference implementation already exists in [`deploy/eb/`](deploy/eb/README.md).** Cheapest AWS-native single-tenant path, self-contained (its own VPC/RDS/Redis), rolls in ~20 min on a cold account. Pick this if the human wants AWS and doesn't specifically ask for something else. |
+| **AWS App Runner** | **Reference implementation already exists in [`deploy/apprunner/`](deploy/apprunner/README.md).** Managed container service with rolling deploys and no instance to own; same self-contained VPC/RDS/Redis as the EB module. Pick this if the human wants AWS with zero-downtime redeploys or already runs other apps on App Runner. |
 | **Amazon Lightsail (container service)** | Small-to-medium sites, predictable monthly pricing, you're already on AWS, want minimal surface area. Alternative to EB if you specifically want Lightsail's fixed-price container pricing model. |
 | **Google Cloud Run** | Serverless containers, scales to zero, pay-per-request, you're already on GCP. Minimal ops. |
 | **Fly.io / Railway / Render** | Global edge, push-to-deploy UX, small team, no dedicated DevOps. |

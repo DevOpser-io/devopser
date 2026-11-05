@@ -1,0 +1,673 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DevOpser template - single-tenant deploy to AWS App Runner with RDS
+  PostgreSQL, ElastiCache Redis, an App Runner VPC connector for private
+  data-plane access, interface VPC endpoints for Secrets Manager, STS and
+  Bedrock, an optional NAT gateway for outbound HTTPS to external APIs,
+  and AWS Secrets Manager for DB credentials and the session secret.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: slo-demo
+    Description: >
+      Base name used for the App Runner service, ECR repo, Secrets Manager
+      prefix, and stack-wide resource names. Must be DNS-safe.
+    AllowedPattern: "^[a-z][a-z0-9-]{2,24}$"
+
+  BedrockModelId:
+    Type: String
+    MinLength: 1
+    Description: >
+      Bedrock model or inference-profile ID the app invokes (e.g. a
+      cross-region "eu." inference profile when deploying to an EU region).
+      Must be available in the deploy region. deploy.sh always passes this;
+      it has no default here so the template stays region-agnostic.
+
+  CreateService:
+    Type: String
+    AllowedValues: [ "false", "true" ]
+    Default: "false"
+    Description: >
+      Phase gate. The first deploy.sh pass sets this to false so the ECR
+      repo exists (and an image is pushed) before the App Runner service
+      tries to pull. The second pass flips it to true.
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: ECR tag the App Runner service should run.
+
+  CustomDomainParam:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated hostnames for the app's CUSTOM_DOMAIN CORS allowlist.
+      Left empty on first create because the App Runner default domain only
+      exists after the service is provisioned; deploy.sh reads it from the
+      stack outputs and re-deploys with this parameter set (see AGENTS.md >
+      "CORS for deployed environments").
+
+  SiteBaseUrlParam:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^https?://[^/\\s]+$"
+    Description: >
+      Canonical public origin (scheme + host, no path) delivered to the
+      service as SITE_BASE_URL. backend/routes/auth.js builds emailed
+      sign-in links and the Google OAuth callback from it and never from
+      request headers; without it the app falls back to the FIRST
+      CUSTOM_DOMAIN entry, which is an order-sensitive CORS allowlist. Left
+      empty on first create for the same reason as CustomDomainParam;
+      deploy.sh phase 3 sets it to https://<service domain> unless
+      SITE_BASE_URL is overridden in the deploy environment.
+
+  SesFromEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: >
+      Sender address for transactional email via SES (USE_SES path in
+      backend/services/emailService.js). The SES identity itself is created
+      by deploy.sh outside this stack (idempotent, so an identity shared
+      with another stack never conflicts). When set, the stack provisions
+      the SES API VPC endpoint, grants the instance role ses:SendEmail
+      scoped to the identity, and enables USE_SES on the service. Leave
+      empty to keep email disabled. Sign-in is by emailed link only, so
+      without a sender nobody can log in.
+
+  ExternalEgress:
+    Type: String
+    AllowedValues: [ "false", "true" ]
+    Default: "false"
+    Description: >
+      When true, adds a public subnet, internet gateway and a single-AZ NAT
+      gateway so the private subnets get outbound HTTPS to the internet
+      (needed only for external APIs with no AWS VPC endpoint, e.g. Google
+      OAuth or a non-Bedrock LLM provider). AWS APIs the app calls (Secrets
+      Manager, STS, Bedrock, SES) always go through interface endpoints, so
+      the default is off (~$35/month saved).
+
+  DemoFaultErrorRate:
+    Type: String
+    Default: "0"
+    AllowedPattern: "^(0|1|0?\\.[0-9]+|1\\.0)$"
+    Description: >
+      SLO demo only. Share of non-health requests (0 to 1) the app answers
+      with HTTP 500, delivered as DEMO_FAULT_ERROR_RATE
+      (backend/middleware/demoFault.js). 0, the default, disables it.
+      deploy.sh passes DEMO_FAULT_ERROR_RATE from its environment: deploy
+      with a value to stage an incident, deploy again without it to stage
+      the fix.
+
+  DemoFaultLatencyRate:
+    Type: String
+    Default: "0"
+    AllowedPattern: "^(0|1|0?\\.[0-9]+|1\\.0)$"
+    Description: >
+      SLO demo only. Share of non-health requests (0 to 1) delayed by
+      DemoFaultLatencyMs, delivered as DEMO_FAULT_LATENCY_RATE. 0 disables it.
+
+  DemoFaultLatencyMs:
+    Type: String
+    Default: "900"
+    AllowedPattern: "^[0-9]+$"
+    Description: >
+      SLO demo only. Delay in milliseconds applied to the DemoFaultLatencyRate
+      share of requests, delivered as DEMO_FAULT_LATENCY_MS.
+
+Conditions:
+  WithService: !Equals [ !Ref CreateService, "true" ]
+  HasCustomDomain: !Not [ !Equals [ !Ref CustomDomainParam, "" ] ]
+  HasSiteBaseUrl: !Not [ !Equals [ !Ref SiteBaseUrlParam, "" ] ]
+  HasSesSender: !Not [ !Equals [ !Ref SesFromEmail, "" ] ]
+  WithNat: !Equals [ !Ref ExternalEgress, "true" ]
+
+Resources:
+
+  # ---------- VPC ----------
+  # Private-only by default: App Runner terminates public ingress on
+  # AWS-managed infrastructure, so nothing here needs an internet gateway
+  # unless ExternalEgress is enabled. The VPC exists to host RDS, Redis,
+  # and the interface endpoints the service reaches through its VPC
+  # connector.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.62.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-vpc" } ]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-rt" } ]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.62.10.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-a" } ]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.62.11.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-private-b" } ]
+
+  PrivateSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+
+  PrivateSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------- Optional external egress (NAT gateway) ----------
+  # Only when ExternalEgress=true. AWS-API traffic still takes the
+  # more-specific in-VPC route to the interface endpoints; only
+  # internet-bound traffic follows this default route.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: WithNat
+    Properties:
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-igw" } ]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: WithNat
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: WithNat
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.62.0.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      MapPublicIpOnLaunch: false
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-a" } ]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: WithNat
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-public-rt" } ]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: WithNat
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: WithNat
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: WithNat
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-nat-eip" } ]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: WithNat
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-nat" } ]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: WithNat
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ---------- Security groups ----------
+  SgConnector:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: >-
+        App Runner VPC connector ENIs. Needs no ingress - App Runner fronts
+        all public traffic; only the egress from this SG into the VPC matters.
+        (EC2 forbids apostrophes in SG descriptions - keep this ASCII-plain.)
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-connector" } ]
+
+  SgDb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: RDS PostgreSQL - only the App Runner connector can reach it
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-db" } ]
+
+  SgDbFromConnector:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgDb
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref SgConnector
+
+  SgRedis:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: ElastiCache Redis - only the App Runner connector can reach it
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-redis" } ]
+
+  SgRedisFromConnector:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgRedis
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref SgConnector
+
+  SgVpcEndpoints:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Interface VPC endpoints - HTTPS from the App Runner connector
+      Tags: [ { Key: Name, Value: !Sub "${AppName}-sg-vpce" } ]
+
+  SgVpceFromConnector:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SgVpcEndpoints
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref SgConnector
+
+  # ---------- Interface VPC endpoints ----------
+  # With EgressType: VPC on the App Runner service, ALL outbound traffic
+  # from the app routes through the private subnets. Without a NAT gateway
+  # every AWS API the app calls at runtime needs an interface endpoint:
+  # Secrets Manager (DB creds via *_SECRET_NAME), STS (the Bedrock client
+  # calls GetCallerIdentity on first use, backend/services/bedrockService.js),
+  # bedrock-runtime (LLM invocations), and the SES API when email is
+  # enabled. RDS and Redis are in-VPC already. Symptom of a missing
+  # endpoint: the SDK call hangs until the request times out, with no
+  # error logged.
+  VpceSecretsManager:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      SecurityGroupIds: [ !Ref SgVpcEndpoints ]
+
+  VpceSts:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      SecurityGroupIds: [ !Ref SgVpcEndpoints ]
+
+  VpceBedrockRuntime:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-runtime"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      SecurityGroupIds: [ !Ref SgVpcEndpoints ]
+
+  # SES API (the SDK's SESClient calls email.<region>.amazonaws.com).
+  # Only provisioned when email is enabled - each interface endpoint
+  # costs ~$8/month per AZ.
+  VpceSesApi:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: HasSesSender
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.email"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      SecurityGroupIds: [ !Ref SgVpcEndpoints ]
+
+  # ---------- RDS ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${AppName} RDS subnet group"
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AppName}-db"
+      Engine: postgres
+      EngineVersion: "16.13"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: devopser
+      # The master password is generated inside Secrets Manager (never
+      # passes through deploy.sh or CloudFormation parameters) and resolved
+      # here with a dynamic reference. The same secret is what the app reads
+      # via DB_PASSWORD_SECRET_NAME, so there is exactly one copy.
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${SecretDbPassword}}}"
+      DBName: devopser
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [ !Ref SgDb ]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      MultiAZ: false
+
+  # ---------- ElastiCache Redis ----------
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub "${AppName} Redis subnet group"
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub "${AppName}-redis"
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: cache.t4g.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      VpcSecurityGroupIds: [ !Ref SgRedis ]
+
+  # ---------- Secrets Manager (five entries for the *_SECRET_NAME pattern) ----------
+  # backend/migrate.sh and backend/config/database.js look up each of
+  # DB name / user / password / host / port as a separate plain-string
+  # secret. All live under the ${AppName}/ prefix, which is exactly what
+  # the instance role's secretsmanager policy is scoped to.
+  SecretDbName:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/db/name"
+      SecretString: devopser
+
+  SecretDbUser:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/db/user"
+      SecretString: devopser
+
+  SecretDbPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/db/password"
+      Description: RDS master password, generated in-place. Plain string.
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # Express session signing secret - generated in-stack, delivered to the
+  # container via App Runner RuntimeEnvironmentSecrets (value never appears
+  # in the template, stack parameters, or DescribeService output). A stack
+  # update does not regenerate it, so active sessions survive re-deploys.
+  SecretSessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/app/session-secret"
+      Description: Express session signing secret, generated in-place. Plain string.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  SecretDbHost:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/db/host"
+      SecretString: !GetAtt Database.Endpoint.Address
+
+  SecretDbPort:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/db/port"
+      SecretString: !GetAtt Database.Endpoint.Port
+
+  # ---------- ECR ----------
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Ref AppName
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+
+  # ---------- IAM: App Runner roles ----------
+  # Instance role: assumed by running tasks; carries the app's runtime
+  # permissions (Bedrock invoke + prefix-scoped Secrets Manager reads).
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-apprunner-instance-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: tasks.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bedrock-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                # The Converse / ConverseStream runtime APIs are authorized by
+                # InvokeModel / InvokeModelWithResponseStream - there are no
+                # separate bedrock:Converse* IAM actions.
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  # Foundation-model ARNs are wildcarded across regions
+                  # because cross-region inference profiles (eu.* / us.*)
+                  # fan invocations out to sibling regions; the caller needs
+                  # foundation-model permission in every destination region.
+                  # Foundation-model ARNs have no account segment.
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+        - PolicyName: secrets-scoped
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/*"
+        - !If
+          - HasSesSender
+          - PolicyName: ses-send-scoped
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ses:SendEmail
+                    - ses:SendRawEmail
+                  Resource:
+                    - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesFromEmail}"
+          - !Ref "AWS::NoValue"
+
+  # ECR access role: assumed by App Runner's build/deploy plane to pull the
+  # container image from the private ECR repo.
+  EcrAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-apprunner-ecr-access-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: build.apprunner.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  # ---------- App Runner ----------
+  VpcConnector:
+    Type: AWS::AppRunner::VpcConnector
+    Properties:
+      VpcConnectorName: !Sub "${AppName}-vpc-connector"
+      Subnets: [ !Ref PrivateSubnetA, !Ref PrivateSubnetB ]
+      SecurityGroups: [ !Ref SgConnector ]
+
+  AutoScalingConfig:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: !Sub "${AppName}-asc"
+      MinSize: 1
+      MaxSize: 2
+      MaxConcurrency: 100
+
+  Service:
+    Type: AWS::AppRunner::Service
+    Condition: WithService
+    # The env vars reference the secrets by NAME (plain strings), which
+    # creates no implicit dependency - make it explicit so a first boot
+    # never races secret creation. The VPC endpoints must exist before the
+    # first instance boots, because migrate.sh fetches secrets through them.
+    DependsOn:
+      - SecretDbName
+      - SecretDbUser
+      - SecretDbPassword
+      - SecretDbHost
+      - SecretDbPort
+      - VpceSecretsManager
+      - VpceSts
+      - VpceBedrockRuntime
+    Properties:
+      ServiceName: !Ref AppName
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt EcrAccessRole.Arn
+        # Deploys are driven deterministically by the ImageTag parameter
+        # (deploy.sh passes a unique version label per run); auto-deploy on
+        # :latest pushes would race the CloudFormation updates.
+        AutoDeploymentsEnabled: false
+        ImageRepository:
+          ImageIdentifier: !Sub "${EcrRepo.RepositoryUri}:${ImageTag}"
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: "8000"
+            RuntimeEnvironmentVariables:
+              # The full NODE_ENV=production contract - mirrors deploy/eb.
+              - { Name: NODE_ENV,                Value: production }
+              - { Name: REGION,                  Value: !Ref "AWS::Region" }
+              - { Name: HOST,                    Value: "0.0.0.0" }
+              # PORT is a reserved App Runner env var - the service injects it
+              # from ImageConfiguration.Port; declaring it fails CreateService.
+              - { Name: LLM_PROVIDER,            Value: bedrock }
+              - { Name: BEDROCK_MODEL_ID,        Value: !Ref BedrockModelId }
+              - { Name: DB_NAME_SECRET_NAME,     Value: !Sub "${AppName}/db/name" }
+              - { Name: DB_USER_SECRET_NAME,     Value: !Sub "${AppName}/db/user" }
+              - { Name: DB_PASSWORD_SECRET_NAME, Value: !Sub "${AppName}/db/password" }
+              - { Name: DB_HOST_SECRET_NAME,     Value: !Sub "${AppName}/db/host" }
+              - { Name: DB_PORT_SECRET_NAME,     Value: !Sub "${AppName}/db/port" }
+              - { Name: DB_REQUIRE_SSL,          Value: "true" }
+              - { Name: REDIS_URL,               Value: !Sub "redis://${RedisCluster.RedisEndpoint.Address}:${RedisCluster.RedisEndpoint.Port}" }
+              - !If
+                - HasSesSender
+                - { Name: USE_SES, Value: "true" }
+                - { Name: USE_SES, Value: "false" }
+              - !If
+                - HasSesSender
+                - { Name: SES_FROM_EMAIL, Value: !Ref SesFromEmail }
+                - !Ref "AWS::NoValue"
+              # Only injected once deploy.sh has learned the service's
+              # default domain (App Runner rejects empty env-var values).
+              - !If
+                - HasCustomDomain
+                - { Name: CUSTOM_DOMAIN, Value: !Ref CustomDomainParam }
+                - !Ref "AWS::NoValue"
+              # Canonical public origin for emailed sign-in links + the OAuth
+              # callback (auth.js canonicalBaseUrl). Same phase-3 timing.
+              - !If
+                - HasSiteBaseUrl
+                - { Name: SITE_BASE_URL, Value: !Ref SiteBaseUrlParam }
+                - !Ref "AWS::NoValue"
+              # SLO demo fault injection (inert at the defaults; see the parameters).
+              - { Name: DEMO_FAULT_ERROR_RATE,   Value: !Ref DemoFaultErrorRate }
+              - { Name: DEMO_FAULT_LATENCY_RATE, Value: !Ref DemoFaultLatencyRate }
+              - { Name: DEMO_FAULT_LATENCY_MS,   Value: !Ref DemoFaultLatencyMs }
+            # Secret VALUES fetched by App Runner at deploy time using the
+            # instance role (already scoped to secret:${AppName}/*).
+            RuntimeEnvironmentSecrets:
+              - Name: SESSION_SECRET
+                Value: !Ref SecretSessionSecret
+      InstanceConfiguration:
+        Cpu: "0.25 vCPU"
+        Memory: "0.5 GB"
+        InstanceRoleArn: !GetAtt InstanceRole.Arn
+      AutoScalingConfigurationArn: !GetAtt AutoScalingConfig.AutoScalingConfigurationArn
+      # /health responds as soon as Express binds :8000, but the entrypoint
+      # runs DB migrations BEFORE starting the server - the generous
+      # unhealthy threshold absorbs cold-start migration time.
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /health
+        Interval: 20
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 20
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: VPC
+          VpcConnectorArn: !GetAtt VpcConnector.VpcConnectorArn
+        IngressConfiguration:
+          IsPubliclyAccessible: true
+
+Outputs:
+  AppName:
+    Value: !Ref AppName
+    Export: { Name: !Sub "${AWS::StackName}-AppName" }
+  EcrRepoUri:
+    Value: !GetAtt EcrRepo.RepositoryUri
+    Export: { Name: !Sub "${AWS::StackName}-EcrRepoUri" }
+  RdsEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+  ServiceArn:
+    Condition: WithService
+    Value: !GetAtt Service.ServiceArn
+  ServiceUrl:
+    Condition: WithService
+    Value: !GetAtt Service.ServiceUrl
+    Description: >-
+      App Runner default domain (bare hostname, no scheme). deploy.sh feeds
+      this back into CustomDomainParam for the CORS allowlist.
