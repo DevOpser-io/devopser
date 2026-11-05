@@ -125,6 +125,7 @@ The deployed workload gets these variables (all set by the template, none by han
 
 - **Identity** is `slo-demo/slo-demo` (`service.namespace/service.name`) with `service.version=<image tag>`. Every trace, log, the deployment event and the SLO use the same strings.
 - **SLO:** `slo/slo-demo-availability.slo.yaml` is the availability objective on that identity, scoped to `deployment_environment_name="production"` so laptop traffic never burns the budget. Apply it once, or after changing it, with `op run --env-file=.env -- ./scripts/apply-slo.sh` (needs `DASH0_API_URL`, the `api.` host, and a token with All permissions). Idempotent (`PUT /api/slos/<origin>`).
+- **Throughput SLO:** `slo/slo-demo-throughput.slo.yaml` is the throughput variation of prompt 3: production keeps serving at least 0.01 requests per second, 99% of the time (raw shape, `>= bool` on the `dash0.spans` rate). `apply-slo.sh` applies it with the availability SLO.
 - **Local run** with the same identity in the `local` environment: `op run --env-file=.env -- npm run start:otel`, then `op run --env-file=.env -- ./scripts/verify-telemetry.sh` to send traffic and prove arrival.
 
 ## Subsequent deploys
