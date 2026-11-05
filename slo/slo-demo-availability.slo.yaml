@@ -1,0 +1,46 @@
+# Availability SLO for slo-demo, in Dash0's OpenSLO v1 subset.
+# Applied idempotently by scripts/apply-slo.sh (PUT /api/slos/<dash0.com/origin>).
+#
+# Constraints the Dash0 API enforces (400 otherwise): budgetingMethod
+# Occurrences only; one objective; a single rolling 28d window; good and
+# total are BARE PromQL vector selectors over the dash0.spans metric (label
+# matchers only, no functions); good must be a subset of total.
+apiVersion: openslo.com/v1
+kind: SLO
+metadata:
+  name: slo-demo-availability
+  labels:
+    dash0.com/origin: slo-demo-availability
+  annotations:
+    dash0.com/display-name: slo-demo availability
+spec:
+  description: 99.5% of requests to the slo-demo web app succeed without a server error, measured over the last 28 days.
+  # Must equal what the telemetry reports (service.namespace/service.name):
+  # this is what puts deployment markers on the SLO. The selectors below are
+  # scoped to deployment.environment.name=production so laptops running
+  # `npm run start:otel` (deployment.environment.name=local) against the
+  # same dataset never burn the budget.
+  service: slo-demo/slo-demo
+  budgetingMethod: Occurrences
+  timeWindow:
+    - duration: 28d
+      isRolling: true
+  indicator:
+    spec:
+      ratioMetric:
+        counter: true
+        good:
+          metricSource:
+            type: Prometheus
+            spec:
+              query: '{otel_metric_name="dash0.spans", service_namespace="slo-demo", service_name="slo-demo", deployment_environment_name="production", otel_span_kind="SERVER", otel_span_status_code!="ERROR"}'
+        total:
+          metricSource:
+            type: Prometheus
+            spec:
+              query: '{otel_metric_name="dash0.spans", service_namespace="slo-demo", service_name="slo-demo", deployment_environment_name="production", otel_span_kind="SERVER"}'
+  objectives:
+    - displayName: Availability
+      # Fraction strictly between 0 and 1. Start a little below what the
+      # service achieves today; never 1.0.
+      target: 0.995
