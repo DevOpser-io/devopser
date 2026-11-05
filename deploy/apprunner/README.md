@@ -124,6 +124,7 @@ The deployed workload gets these variables (all set by the template, none by han
 | `OTEL_LOG_LEVEL` | `info` |
 
 - **Identity** is `slo-demo/slo-demo` (`service.namespace/service.name`) with `service.version=<image tag>`. Every trace, log, the deployment event and the SLO use the same strings.
+- **Local run** with the same identity in the `local` environment: `op run --env-file=.env -- npm run start:otel`, then `op run --env-file=.env -- ./scripts/verify-telemetry.sh` to send traffic and prove arrival.
 
 ## Subsequent deploys
 
