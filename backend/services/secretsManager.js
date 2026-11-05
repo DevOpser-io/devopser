@@ -33,7 +33,7 @@ async function getSecret(secretName, region = config.aws.region, secretType = 'p
       try {
         return JSON.parse(secret);
       } catch (e) {
-        console.error(`Failed to parse secret as JSON: ${e}`);
+        console.error(`Failed to parse secret as JSON: ${e.name}`); // never the message, it quotes the value
         throw e;
       }
     }
@@ -66,7 +66,7 @@ async function getAdditionalSecrets() {
   try {
     return JSON.parse(secret);
   } catch (jsonError) {
-    console.log(`ADDITIONAL_SECRETS direct JSON parse failed: ${jsonError.message}`);
+    console.log(`ADDITIONAL_SECRETS direct JSON parse failed: ${jsonError.name}`);
   }
   
   // If it looks like it might be a secret name, try to retrieve it from AWS Secrets Manager
@@ -82,11 +82,11 @@ async function getAdditionalSecrets() {
         try {
           return JSON.parse(secretValue);
         } catch (parseError) {
-          console.log(`Failed to parse retrieved secret as JSON: ${parseError.message}`);
+          console.log(`Failed to parse retrieved secret as JSON: ${parseError.name}`);
         }
       }
     } catch (secretError) {
-      console.log(`Failed to retrieve as AWS secret: ${secretError.message}`);
+      console.log(`Failed to retrieve as AWS secret: ${secretError.name}`);
     }
   }
   
@@ -100,7 +100,7 @@ async function getAdditionalSecrets() {
     }
     return JSON.parse(cleaned);
   } catch (cleanError) {
-    console.log(`Cleaned JSON parse failed: ${cleanError.message}`);
+    console.log(`Cleaned JSON parse failed: ${cleanError.name}`);
   }
   
   console.log(`ADDITIONAL_SECRETS is not valid JSON, treating as plain string. Length: ${secret.length}`);
