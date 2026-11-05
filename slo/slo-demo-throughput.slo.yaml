@@ -1,0 +1,51 @@
+# Throughput SLO for slo-demo, in Dash0's OpenSLO v1 subset (the
+# throughput variation of prompt 3, the R in RED). Applied with the other
+# SLOs by scripts/apply-slo.sh, which PUTs every slo/*.slo.yaml to
+# /api/slos/<dash0.com/origin>.
+#
+# Same document as slo-demo-availability.slo.yaml; only the indicator
+# changes. The promise here is "the service keeps receiving and serving
+# requests": the SLI is the share of time the production request rate stays
+# at or above a floor. It is the same configuration as the SLO Coach
+# throughput SLO in the opentelemetry-demo-us org, with slo-demo's names.
+#
+# Raw shape: the expression must return exactly one series with a value
+# between 0 and 1. Dash0 does not document how a raw ratio is weighted
+# across the window, so read the SLI as roughly the share of time the floor
+# held. Check the expression through the Prometheus API on the API host
+# before applying it.
+apiVersion: openslo.com/v1
+kind: SLO
+metadata:
+  name: slo-demo-throughput
+  labels:
+    dash0.com/origin: slo-demo-throughput
+  annotations:
+    dash0.com/display-name: slo-demo throughput
+spec:
+  description: The slo-demo web app keeps serving at least 0.01 requests per second in production, 99% of the time over the last 28 days.
+  # Identical to the other SLOs and the telemetry
+  # (service.namespace/service.name), so deployment markers land here too.
+  service: slo-demo/slo-demo
+  budgetingMethod: Occurrences
+  timeWindow:
+    - duration: 28d
+      isRolling: true
+  indicator:
+    spec:
+      ratioMetric:
+        # success: the expression returns 1 while the floor holds.
+        rawType: success
+        raw:
+          metricSource:
+            type: Prometheus
+            spec:
+              # sum(rate(...[5m])): production SERVER requests per second.
+              # `or vector(0)`: a complete stall (no spans at all) counts as
+              # 0 instead of leaving the SLI empty.
+              # `>= bool 0.01`: 1 while at or above the floor, 0 below it.
+              query: '(sum(rate({otel_metric_name="dash0.spans", service_namespace="slo-demo", service_name="slo-demo", deployment_environment_name="production", otel_span_kind="SERVER"}[5m])) or vector(0)) >= bool 0.01'
+  objectives:
+    - displayName: Keeps serving requests
+      # About 6h43m below the floor allowed per 28 days.
+      target: 0.99
