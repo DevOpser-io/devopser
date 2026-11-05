@@ -455,6 +455,16 @@ If the deploy will later be fronted by a custom domain + TLS via ACM/Cloudflare/
 
 ---
 
+## Telemetry (OpenTelemetry to Dash0)
+
+The app instruments itself with the OpenTelemetry Node.js zero-code hook. Nothing telemetry-related runs on a plain `npm start`; it activates only when node is started with `--require @opentelemetry/auto-instrumentations-node/register` (plus `--require ./otel-console-bridge.js` for logs), which `scripts/start-otel.sh` does locally and the App Runner template does through `NODE_OPTIONS`.
+
+- **Identity:** `service.name=slo-demo`, `service.namespace=slo-demo`, `service.version=<image tag or git SHA>`, `deployment.environment.name=<production|local>`. Keep them identical in `scripts/start-otel.sh`, `deploy/apprunner/cloudformation.yaml`, the deployment event and the SLO definition. Renaming any of them orphans the existing data and silently blanks every SLO and dashboard that filters on it.
+- **Only `backend/telemetry.js` may import `@opentelemetry/*`.** Product code uses its helpers (`startSpan`, `withSpan`, `recordFirstToken`, `recordLlmUsage`, `markRequestFailed`). Never construct a second SDK.
+- **Attribute discipline:** ids, enums and scalar measures only. No prompts, replies, email addresses or user ids on spans or metrics. Use `gen_ai.*`, `db.*`, `http.*` names from the semantic conventions where one exists, `slo_demo.*` otherwise.
+- **Logs:** the app logs through `console.*` and morgan. `backend/otel-console-bridge.js` copies every console line to the OTel logs API with trace correlation; stdout output is unchanged. Note that some existing log lines print full Bedrock request bodies, so they reach the backend as well.
+- **Local run:** `op run --env-file=.env -- npm run start:otel`. The start script derives the `OTEL_*` variables from `DASH0_OTLP_URL`, `DASH0_AUTH_TOKEN` and `DASH0_DATASET` and refuses an empty or unresolved (`op://`) token. It never loads `.env` itself.
+
 ## Rules for any code you add
 
 1. **Portability is non-negotiable.** Self-hosted and managed-hosting deploys run the same code. Gate production-only behavior on `NODE_ENV === 'production'`, not on feature flags or separate files.

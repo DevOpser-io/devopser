@@ -8,6 +8,7 @@
 const { BedrockRuntimeClient, ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { STSClient, AssumeRoleCommand, GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
 const config = require('../config');
+const telemetry = require('../telemetry');
 const { WEBSITE_TOOLS, executeTool, getAgentSystemPrompt } = require('./websiteAgentTools');
 
 // Bedrock client with cross-account support
@@ -77,10 +78,12 @@ async function getBedrockClient() {
  * @param {Array} conversationHistory - Previous messages
  * @returns {Promise<Object>} - { message, newConfig, toolsUsed }
  */
-async function processWithTools(userMessage, currentConfig = null, conversationHistory = []) {
+async function processWithToolsInner(userMessage, currentConfig, conversationHistory, span) {
   const client = await getBedrockClient();
   let workingConfig = currentConfig ? JSON.parse(JSON.stringify(currentConfig)) : null;
   const toolsUsed = [];
+  const usage = { input: 0, output: 0 };
+  let lastStopReason = null;
 
   // Build messages for Converse API
   const messages = [];
@@ -135,8 +138,13 @@ async function processWithTools(userMessage, currentConfig = null, conversationH
         }
       }));
 
+      if (response.usage) {
+        usage.input += response.usage.inputTokens || 0;
+        usage.output += response.usage.outputTokens || 0;
+      }
       const output = response.output;
       const stopReason = response.stopReason;
+      lastStopReason = stopReason;
 
       console.log(`[AgentV2] Stop reason: ${stopReason}`);
 
@@ -160,8 +168,16 @@ async function processWithTools(userMessage, currentConfig = null, conversationH
           const { toolUseId, name, input } = block.toolUse;
           console.log(`[AgentV2] Executing tool: ${name}`, JSON.stringify(input).substring(0, 200));
 
-          // Execute the tool
-          const result = executeTool(name, input, workingConfig);
+          // Execute the tool: one child span per call. The tool input is site
+          // content, so it stays off the span; only the name, call id and
+          // outcome are recorded.
+          const toolSpan = telemetry.startSpan(`execute_tool ${name}`, {
+            'gen_ai.operation.name': 'execute_tool',
+            'gen_ai.tool.name': name,
+            'gen_ai.tool.call.id': toolUseId,
+          });
+          const result = toolSpan.run(() => executeTool(name, input, workingConfig));
+          toolSpan.end({ 'slo_demo.tool.success': !!result.success });
           toolsUsed.push({ name, input, result: result.message });
 
           // Update working config if tool succeeded
@@ -221,11 +237,42 @@ async function processWithTools(userMessage, currentConfig = null, conversationH
     finalResponse = "I'm not sure how to help with that. Try describing what kind of website you want, or ask me to make specific changes.";
   }
 
+  span.setAttributes({
+    'gen_ai.usage.input_tokens': usage.input,
+    'gen_ai.usage.output_tokens': usage.output,
+    'gen_ai.response.finish_reasons': [lastStopReason || 'none'],
+    'slo_demo.site_agent.iterations': iteration,
+    'slo_demo.site_agent.tool_calls': toolsUsed.length,
+    'slo_demo.site_agent.produced_config': !!(workingConfig && workingConfig.sections && workingConfig.sections.length),
+  });
+  telemetry.recordLlmUsage({
+    provider: 'aws.bedrock', model: config.bedrock.modelId,
+    input_tokens: usage.input, output_tokens: usage.output,
+  });
+
   return {
     message: finalResponse,
     newConfig: workingConfig,
     toolsUsed
   };
+}
+
+/**
+ * One site-agent turn (the landing-page preview and the builder both come
+ * through here): the business-level span around the Converse tool loop.
+ * This service talks to Bedrock directly rather than through services/llm,
+ * so it carries its own gen_ai.* attributes. The description and the
+ * generated site content never go on the span.
+ */
+async function processWithTools(userMessage, currentConfig = null, conversationHistory = []) {
+  return telemetry.withSpan('slo_demo.site_agent.turn', {
+    'gen_ai.operation.name': 'invoke_agent',
+    'gen_ai.agent.name': 'website-agent',
+    'gen_ai.provider.name': 'aws.bedrock',
+    'gen_ai.request.model': config.bedrock.modelId,
+    'slo_demo.site_agent.has_config': !!currentConfig,
+    'slo_demo.site_agent.history_messages': conversationHistory.length,
+  }, (span) => processWithToolsInner(userMessage, currentConfig, conversationHistory, span));
 }
 
 /**

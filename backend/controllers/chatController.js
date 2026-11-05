@@ -3,6 +3,7 @@
  * Handles all chat-related functionality including streaming responses
  */
 const llm = require('../services/llm');
+const telemetry = require('../telemetry');
 const config = require('../config');
 const models = require('../models');
 
@@ -193,6 +194,18 @@ async function streamResponse(req, res) {
     console.log(`Last user message: "${lastUserMessage.content.substring(0, 50)}..."`);
     console.log(`Chat history length: ${chatHistory.length} messages`);
     
+    // One chat turn: the business-level span the SLO reviewer filters on.
+    // Auto-instrumentation supplies the server span above it and the Bedrock,
+    // redis and pg spans below it. Attributes are counts and enums only; the
+    // prompt, the reply and the conversation id stay off the span.
+    const turn = telemetry.startSpan('slo_demo.chat.turn', {
+      'gen_ai.operation.name': 'chat',
+      'gen_ai.provider.name': llm.genAiProvider,
+      'gen_ai.request.model': llm.model,
+      'slo_demo.chat.history_messages': chatHistory.length,
+    });
+    const turnStart = Date.now();
+    let firstTokenMs = null;
     try {
       let assistantResponse = '';
 
@@ -208,12 +221,27 @@ async function streamResponse(req, res) {
       // Stream the response via the LLM facade (Bedrock / OpenAI / Anthropic).
       // Each provider yields already-normalized text deltas so this loop no
       // longer needs to know about chunk envelope formats.
-      for await (const delta of llm.streamResponse(chatHistory)) {
-        if (!delta) continue;
-        assistantResponse += delta;
-        res.write(`data: ${JSON.stringify({ content: delta })}\n\n`);
-        if (res.flush) res.flush();
-      }
+      await turn.run(async () => {
+        const stream = llm.streamResponse(chatHistory, {
+          onUsage: (usage) => {
+            turn.setAttributes({
+              'gen_ai.usage.input_tokens': usage.input_tokens,
+              'gen_ai.usage.output_tokens': usage.output_tokens,
+            });
+            telemetry.recordLlmUsage({ provider: llm.genAiProvider, model: llm.model, ...usage });
+          },
+        });
+        for await (const delta of stream) {
+          if (!delta) continue;
+          if (firstTokenMs === null) {
+            firstTokenMs = Date.now() - turnStart;
+            telemetry.recordFirstToken(firstTokenMs);
+          }
+          assistantResponse += delta;
+          res.write(`data: ${JSON.stringify({ content: delta })}\n\n`);
+          if (res.flush) res.flush();
+        }
+      });
 
       // Always send a terminal [DONE] marker once the provider's stream ends.
       res.write(`data: ${JSON.stringify({
@@ -248,12 +276,20 @@ async function streamResponse(req, res) {
       }
       
       // Save updated history to Redis
-      await saveChatHistory(conversationId, chatHistory);
+      await turn.run(() => saveChatHistory(conversationId, chatHistory));
+      turn.end({
+        'slo_demo.chat.first_token_ms': firstTokenMs === null ? -1 : firstTokenMs,
+        'slo_demo.chat.response_chars': assistantResponse.length,
+      });
       
       // Note: Database updates removed for performance - Redis is primary storage
       // Database persistence happens in processMessage() when conversations become significant
       // and in resetConversation() when conversations end
     } catch (streamError) {
+      // Headers are usually flushed by now, so the response ends as a 200 with
+      // an error event: the HTTP instrumentation would count it as a success.
+      turn.fail(streamError);
+      telemetry.markRequestFailed(streamError);
       console.error(`Error during stream processing: ${streamError.message}`);
       console.error(`Stream error stack: ${streamError.stack}`);
       
@@ -273,6 +309,7 @@ async function streamResponse(req, res) {
       }
     }
   } catch (error) {
+    telemetry.markRequestFailed(error);
     console.error('Error streaming response:', error);
     
     // Send error response in SSE format
