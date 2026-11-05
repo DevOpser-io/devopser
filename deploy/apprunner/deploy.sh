@@ -4,10 +4,13 @@
 #   2) docker build/push, then CFN with CreateService=true (App Runner service)
 #   3) CORS + origin patch: CFN pass with CustomDomainParam=<App Runner default
 #      domain> and SiteBaseUrlParam=https://<that domain> (or $SITE_BASE_URL)
-# Idempotent. Re-run to deploy a new version of the code.
+# Idempotent. Re-run to deploy a new version of the code. When telemetry to
+# Dash0 is configured (DASH0_OTLP_URL + DASH0_AUTH_TOKEN, environment first,
+# repo .env second), the service is deployed instrumented.
 #
 # Pre-reqs: working AWS creds (aws sts get-caller-identity succeeds),
 # docker daemon running, curl.
+# With a 1Password reference in .env:  op run --env-file=.env -- ./deploy/apprunner/deploy.sh
 
 set -euo pipefail
 
@@ -37,6 +40,75 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/nu
 log "account: ${ACCOUNT_ID} region: ${AWS_REGION} profile: ${AWS_PROFILE}"
 
 VERSION_LABEL="v-$(date +%Y%m%d-%H%M%S)-$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+
+# ---------- Dash0 values: environment first, then the repo .env ----------
+# The same three values scripts/start-otel.sh reads locally drive the
+# deployed workload. Anything already in the environment wins (a CI secret
+# store, `op run --env-file=.env --`), so a password-manager reference in
+# .env is never read as a literal.
+dotenv_value() {
+  [[ -f "${REPO_ROOT}/.env" ]] || return 0
+  local line; line=$(grep -E "^[[:space:]]*$1=" "${REPO_ROOT}/.env" | tail -1 || true)
+  [[ -n "${line}" ]] || return 0
+  line="${line#*=}"; line="${line%\"}"; line="${line#\"}"; line="${line%\'}"; line="${line#\'}"
+  # A 1Password secret reference is not the value. Resolve it through the
+  # CLI when present (the app prompts for approval), otherwise stop: running
+  # with the literal reference would put "op://..." into the OTLP headers.
+  if [[ "${line}" == op://* ]]; then
+    command -v op >/dev/null \
+      || fail "$1 in .env is a 1Password reference; start this script as: op run --env-file=.env -- $0"
+    line=$(op read "${line}" 2>/dev/null) \
+      || fail "could not resolve $1 from 1Password (approve the prompt, or start as: op run --env-file=.env -- $0)"
+  fi
+  printf '%s' "${line}"
+}
+DASH0_OTLP_URL="${DASH0_OTLP_URL:-$(dotenv_value DASH0_OTLP_URL)}"
+DASH0_AUTH_TOKEN="${DASH0_AUTH_TOKEN:-$(dotenv_value DASH0_AUTH_TOKEN)}"
+DASH0_DATASET="${DASH0_DATASET:-$(dotenv_value DASH0_DATASET)}"
+[[ "${DASH0_AUTH_TOKEN}" != op://* ]] \
+  || fail "DASH0_AUTH_TOKEN is an unresolved 1Password reference; start as: op run --env-file=.env -- $0"
+
+# ---------- telemetry to Dash0 ----------
+# The ingest token goes into ONE Secrets Manager entry holding the complete
+# OTLP headers string, mapped to OTEL_EXPORTER_OTLP_HEADERS through App Runner
+# RuntimeEnvironmentSecrets. Only the secret's ARN and the (non-secret)
+# ingress URL reach CloudFormation. When DASH0_OTLP_URL is unset the params
+# are omitted, which keeps the stack's previous values on an update.
+OTEL_PARAM=()
+if [[ -n "${DASH0_OTLP_URL}" ]]; then
+  [[ -n "${DASH0_AUTH_TOKEN}" ]] || fail "DASH0_OTLP_URL is set but DASH0_AUTH_TOKEN is empty"
+  case "${DASH0_OTLP_URL}" in
+    *api.*) fail "DASH0_OTLP_URL points at the API host (${DASH0_OTLP_URL}); telemetry goes to the ingress host";;
+  esac
+  OTEL_DATASET="${DASH0_DATASET:-default}"
+  OTEL_HEADERS_VALUE="Authorization=Bearer ${DASH0_AUTH_TOKEN},Dash0-Dataset=${OTEL_DATASET}"
+  OTEL_HEADERS_SECRET_NAME="${APP_NAME}/otel/otlp-headers"
+  OTEL_HEADERS_ARN=$(aws secretsmanager describe-secret \
+    --region "${AWS_REGION}" --secret-id "${OTEL_HEADERS_SECRET_NAME}" \
+    --query ARN --output text 2>/dev/null || true)
+  if [[ -z "${OTEL_HEADERS_ARN}" || "${OTEL_HEADERS_ARN}" == "None" ]]; then
+    log "creating OTLP headers secret (${OTEL_HEADERS_SECRET_NAME})"
+    OTEL_HEADERS_ARN=$(aws secretsmanager create-secret \
+      --region "${AWS_REGION}" --name "${OTEL_HEADERS_SECRET_NAME}" \
+      --description "${APP_NAME} Dash0 OTLP headers (Authorization + Dash0-Dataset)" \
+      --secret-string "${OTEL_HEADERS_VALUE}" --query ARN --output text) \
+      || fail "failed to create ${OTEL_HEADERS_SECRET_NAME}"
+  else
+    log "updating OTLP headers secret (token/dataset may have changed)"
+    aws secretsmanager put-secret-value --region "${AWS_REGION}" \
+      --secret-id "${OTEL_HEADERS_SECRET_NAME}" \
+      --secret-string "${OTEL_HEADERS_VALUE}" >/dev/null || fail "failed to update ${OTEL_HEADERS_SECRET_NAME}"
+  fi
+  OTEL_PARAM=(OtelExporterEndpoint="${DASH0_OTLP_URL}" OtelHeadersSecretArn="${OTEL_HEADERS_ARN}")
+  # The ingress is an external host: the private subnets need the NAT gateway.
+  if [[ "${EXTERNAL_EGRESS}" != "true" ]]; then
+    log "telemetry needs external egress: forcing EXTERNAL_EGRESS=true (NAT gateway, ~\$35/month)"
+    EXTERNAL_EGRESS=true
+  fi
+  log "telemetry enabled -> ${DASH0_OTLP_URL} (dataset ${OTEL_DATASET}) as ${APP_NAME}/${APP_NAME} ${VERSION_LABEL}"
+else
+  log "telemetry disabled (set DASH0_OTLP_URL + DASH0_AUTH_TOKEN, or put them in .env, to enable)"
+fi
 
 stack_output() {
   aws cloudformation describe-stacks \
@@ -102,6 +174,7 @@ aws cloudformation deploy \
       BedrockModelId="${BEDROCK_MODEL_ID}" \
       ExternalEgress="${EXTERNAL_EGRESS}" \
       ${SES_PARAM[@]+"${SES_PARAM[@]}"} \
+      ${OTEL_PARAM[@]+"${OTEL_PARAM[@]}"} \
   --tags aws-apn-id="pc:${DEVOPSER_APN_PRODUCT_CODE}" \
   --no-fail-on-empty-changeset
 
@@ -157,6 +230,7 @@ aws cloudformation deploy \
       BedrockModelId="${BEDROCK_MODEL_ID}" \
       ExternalEgress="${EXTERNAL_EGRESS}" \
       ${SES_PARAM[@]+"${SES_PARAM[@]}"} \
+      ${OTEL_PARAM[@]+"${OTEL_PARAM[@]}"} \
       CreateService=true \
       ImageTag="${VERSION_LABEL}" \
       DemoFaultErrorRate="${DEMO_FAULT_ERROR_RATE:-0}" \

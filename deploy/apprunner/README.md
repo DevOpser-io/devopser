@@ -43,6 +43,9 @@ sender on the first deploy or nobody can log in. See "Transactional email".
 | `SES_FROM_EMAIL` | `""` (email disabled) | Transactional-email sender. Only passed to CFN when non-empty, so re-runs without it keep the previous value |
 | `SITE_BASE_URL` | `https://<App Runner domain>` | Canonical public origin baked into emailed sign-in links and the Google OAuth callback. Override once a custom domain fronts the service |
 | `EXTERNAL_EGRESS` | `false` | `true` adds a NAT gateway so the container can reach non-AWS hosts (see "Networking") |
+| `DASH0_OTLP_URL` | `""` (telemetry off) | Dash0 OTLP/HTTP ingress, e.g. `https://ingress.<region>.aws.dash0.com`. Environment first, then the repo `.env` |
+| `DASH0_AUTH_TOKEN` | `""` | Dash0 token with Ingesting permission. Stored in Secrets Manager as `${APP_NAME}/otel/otlp-headers`, never a template parameter. An `op://` reference is resolved with `op read` or refused |
+| `DASH0_DATASET` | `default` | Dataset the telemetry, the SLO and the deployment event all use. Must be the same for all three |
 | `DEMO_FAULT_ERROR_RATE` | `0` | SLO demo only. Share (0 to 1) of non-health requests the app answers with 500 (`backend/middleware/demoFault.js`). Deploy with it set to stage an incident, re-run without it to stage the fix |
 | `DEMO_FAULT_LATENCY_RATE` / `DEMO_FAULT_LATENCY_MS` | `0` / `900` | SLO demo only. Share of non-health requests delayed, and by how much |
 | `DEVOPSER_APN_PRODUCT_CODE` | same as `deploy/eb` | AWS Partner attribution tag `aws-apn-id=pc:<code>` on the stack |
@@ -59,6 +62,8 @@ sender on the first deploy or nobody can log in. See "Transactional email".
 | `SiteBaseUrlParam` | `""` | Delivered as `SITE_BASE_URL`; patched in by phase 3 |
 | `SesFromEmail` | `""` | SES VPC endpoint, scoped send permission and `USE_SES=true` when set |
 | `ExternalEgress` | `false` | NAT gateway, public subnet and internet gateway when `true` |
+| `OtelExporterEndpoint` | `""` | Dash0 OTLP ingress. When set, the service gets the activation hook and every `OTEL_*` variable below |
+| `OtelHeadersSecretArn` | `""` | ARN of the `${AppName}/otel/otlp-headers` secret, delivered as the `OTEL_EXPORTER_OTLP_HEADERS` runtime secret |
 | `DemoFaultErrorRate` / `DemoFaultLatencyRate` / `DemoFaultLatencyMs` | `0` / `0` / `900` | Delivered as `DEMO_FAULT_*`; inert at the defaults |
 
 ## How the three phases work
@@ -101,6 +106,25 @@ service.
 Sandbox caveat: a fresh account can only send TO verified addresses until
 AWS grants production access. The DevRel account already has it.
 
+## Telemetry, SLO and deployment marker
+
+Supply the three Dash0 values (environment or repo `.env`; the environment wins, so `op run --env-file=.env -- ./deploy/apprunner/deploy.sh` works with a password-manager reference) and the deploy wires everything. The script forces `EXTERNAL_EGRESS=true` in that case because the ingress is an external host.
+
+The deployed workload gets these variables (all set by the template, none by hand):
+
+| Variable | Value |
+|---|---|
+| `NODE_OPTIONS` | `--require @opentelemetry/auto-instrumentations-node/register --require /app/backend/otel-console-bridge.js` (activation hook plus the console log bridge) |
+| `OTEL_SERVICE_NAME` | `slo-demo` (`AppName`) |
+| `OTEL_RESOURCE_ATTRIBUTES` | `service.namespace=slo-demo,service.version=<ImageTag>,deployment.environment.name=production` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `OtelExporterEndpoint` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | runtime secret: `Authorization=Bearer <token>,Dash0-Dataset=<dataset>` |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` | `otlp` (all three explicit) |
+| `OTEL_LOG_LEVEL` | `info` |
+
+- **Identity** is `slo-demo/slo-demo` (`service.namespace/service.name`) with `service.version=<image tag>`. Every trace, log, the deployment event and the SLO use the same strings.
+
 ## Subsequent deploys
 
 Re-running `deploy.sh` builds a fresh image with a new tag and rolls the
@@ -141,8 +165,8 @@ first chat hangs until the SDK times out), `bedrock-runtime`, and SES when
 email is enabled. There is no NAT gateway by default, so the container has
 no route to the public internet.
 
-Set `EXTERNAL_EGRESS=true` when the app needs a non-AWS host: Google OAuth
-or the OpenAI/Anthropic
+Set `EXTERNAL_EGRESS=true` when the app needs a non-AWS host: an OTLP
+telemetry ingress such as Dash0, Google OAuth, or the OpenAI/Anthropic
 providers. That adds a public subnet, internet gateway and a single-AZ NAT
 gateway (about $35/month). AWS-API traffic keeps using the endpoints.
 
@@ -157,7 +181,7 @@ gateway (about $35/month). AWS-API traffic keeps using the endpoints.
 | Secrets Manager (6 secrets) + ECR storage | 3 |
 | **Total** | **~85 to 105** |
 
-Add about $35 for the NAT gateway when `EXTERNAL_EGRESS=true`.
+Add about $35 for the NAT gateway when `EXTERNAL_EGRESS=true`, which telemetry export turns on.
 
 ## Destroy
 

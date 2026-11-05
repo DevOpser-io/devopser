@@ -83,10 +83,33 @@ Parameters:
     Description: >
       When true, adds a public subnet, internet gateway and a single-AZ NAT
       gateway so the private subnets get outbound HTTPS to the internet
-      (needed only for external APIs with no AWS VPC endpoint, e.g. Google
-      OAuth or a non-Bedrock LLM provider). AWS APIs the app calls (Secrets
-      Manager, STS, Bedrock, SES) always go through interface endpoints, so
-      the default is off (~$35/month saved).
+      (needed only for external APIs with no AWS VPC endpoint, e.g. an OTLP
+      telemetry ingress, Google OAuth, or a non-Bedrock LLM provider). AWS
+      APIs the app calls (Secrets Manager, STS, Bedrock, SES) always go
+      through interface endpoints, so the default is off (~$35/month saved).
+      deploy.sh turns it on automatically when telemetry export to Dash0 is
+      configured, because the OTLP ingress is an external host.
+
+  OtelExporterEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      Dash0 OTLP/HTTP ingress for the app's own telemetry, e.g.
+      https://ingress.<region>.aws.dash0.com (Settings > Endpoints; the
+      ingress host, not api.). When set, the service gets the OpenTelemetry
+      activation hook and every OTEL_* variable. When empty, nothing
+      telemetry-related is injected and the app runs uninstrumented.
+
+  OtelHeadersSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Secrets Manager secret holding the complete OTLP headers
+      string `Authorization=Bearer <token>,Dash0-Dataset=<dataset>`,
+      delivered to the container as OTEL_EXPORTER_OTLP_HEADERS through
+      RuntimeEnvironmentSecrets. deploy.sh stores it under
+      ${AppName}/otel/otlp-headers from the operator-supplied values and
+      passes only the ARN; the token never enters this template.
 
   DemoFaultErrorRate:
     Type: String
@@ -122,6 +145,8 @@ Conditions:
   HasSiteBaseUrl: !Not [ !Equals [ !Ref SiteBaseUrlParam, "" ] ]
   HasSesSender: !Not [ !Equals [ !Ref SesFromEmail, "" ] ]
   WithNat: !Equals [ !Ref ExternalEgress, "true" ]
+  HasOtelEndpoint: !Not [ !Equals [ !Ref OtelExporterEndpoint, "" ] ]
+  HasOtelHeaders: !Not [ !Equals [ !Ref OtelHeadersSecretArn, "" ] ]
 
 Resources:
 
@@ -624,11 +649,67 @@ Resources:
               - { Name: DEMO_FAULT_ERROR_RATE,   Value: !Ref DemoFaultErrorRate }
               - { Name: DEMO_FAULT_LATENCY_RATE, Value: !Ref DemoFaultLatencyRate }
               - { Name: DEMO_FAULT_LATENCY_MS,   Value: !Ref DemoFaultLatencyMs }
+              # --- OpenTelemetry to Dash0 (only when an ingress is supplied) ---
+              # Activation hook: the zero-code register hook loads the SDK
+              # before server.js (CommonJS, hence --require), and the console
+              # bridge copies console/morgan output to the OTel logs API.
+              # Both paths are inside the image (entrypoint.sh runs from
+              # /app/backend). Telemetry goes straight to Dash0, no collector;
+              # the egress is the NAT gateway (ExternalEgress=true).
+              - !If
+                - HasOtelEndpoint
+                - { Name: NODE_OPTIONS, Value: "--require @opentelemetry/auto-instrumentations-node/register --require /app/backend/otel-console-bridge.js" }
+                - !Ref "AWS::NoValue"
+              # service.name / service.namespace are the join key for the SLO
+              # (spec.service = slo-demo/slo-demo), the deployment marker and
+              # every dashboard. They must equal scripts/start-otel.sh and
+              # slo/*.slo.yaml exactly. service.version is the image tag,
+              # the same string deploy.sh puts on the dash0.deployment event.
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_SERVICE_NAME, Value: !Ref AppName }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_RESOURCE_ATTRIBUTES, Value: !Sub "service.namespace=${AppName},service.version=${ImageTag},deployment.environment.name=production" }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: !Ref OtelExporterEndpoint }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_EXPORTER_OTLP_PROTOCOL, Value: http/protobuf }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_TRACES_EXPORTER, Value: otlp }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_METRICS_EXPORTER, Value: otlp }
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_LOGS_EXPORTER, Value: otlp }
+                - !Ref "AWS::NoValue"
+              # Surface exporter status (incl. auth failures) in App Runner logs.
+              - !If
+                - HasOtelEndpoint
+                - { Name: OTEL_LOG_LEVEL, Value: info }
+                - !Ref "AWS::NoValue"
             # Secret VALUES fetched by App Runner at deploy time using the
             # instance role (already scoped to secret:${AppName}/*).
             RuntimeEnvironmentSecrets:
               - Name: SESSION_SECRET
                 Value: !Ref SecretSessionSecret
+              # OTLP headers (`Authorization=Bearer <token>,Dash0-Dataset=<dataset>`)
+              # as one whole secret, so the ingest token never appears in
+              # env-var listings or in this template.
+              - !If
+                - HasOtelHeaders
+                - { Name: OTEL_EXPORTER_OTLP_HEADERS, Value: !Ref OtelHeadersSecretArn }
+                - !Ref "AWS::NoValue"
       InstanceConfiguration:
         Cpu: "0.25 vCPU"
         Memory: "0.5 GB"
