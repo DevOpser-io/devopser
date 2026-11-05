@@ -1,0 +1,52 @@
+# Latency SLO for slo-demo, in Dash0's OpenSLO v1 subset (the latency
+# variation of prompt 3). Applied with the availability SLO by
+# scripts/apply-slo.sh, which PUTs every slo/*.slo.yaml to
+# /api/slos/<dash0.com/origin>.
+#
+# Same document as slo-demo-availability.slo.yaml; only the indicator
+# changes. The SLI is the share of production requests answered within
+# 500 ms, computed from dash0.spans.duration, the span-duration histogram
+# Dash0 derives from the traces the app already sends.
+#
+# The raw shape hands Dash0 a ready-made ratio, so: the expression must
+# return exactly one series with a value between 0 and 1, the SLO page has
+# no "View bad events in Traces" link, and Dash0 cannot count the requests
+# behind the ratio. Check the expression through the Prometheus API on the
+# API host before applying it.
+apiVersion: openslo.com/v1
+kind: SLO
+metadata:
+  name: slo-demo-latency
+  labels:
+    dash0.com/origin: slo-demo-latency
+  annotations:
+    dash0.com/display-name: slo-demo latency
+spec:
+  description: 99% of requests to the slo-demo web app are answered within 500 ms, measured over the last 28 days.
+  # Identical to the availability SLO and the telemetry
+  # (service.namespace/service.name), so deployment markers land here too.
+  service: slo-demo/slo-demo
+  budgetingMethod: Occurrences
+  timeWindow:
+    - duration: 28d
+      isRolling: true
+  indicator:
+    spec:
+      ratioMetric:
+        # success: the expression returns the FAST fraction (good / total).
+        rawType: success
+        raw:
+          metricSource:
+            type: Prometheus
+            spec:
+              # histogram_fraction(lower, upper, histogram): share of
+              # observations between 0 and 0.5 seconds. sum() collapses the
+              # per-operation series into one; rate(...[5m]) turns the
+              # cumulative histogram into the last five minutes.
+              query: 'histogram_fraction(0, 0.5, sum(rate({otel_metric_name="dash0.spans.duration", service_namespace="slo-demo", service_name="slo-demo", deployment_environment_name="production", otel_span_kind="SERVER"}[5m])))'
+  objectives:
+    - displayName: Latency under 500 ms
+      # Threshold a little above today's p99, target a little below today's
+      # fast fraction. The demo fault (DEMO_FAULT_LATENCY_MS, default 900 ms)
+      # is above the threshold, so a latency incident burns this budget.
+      target: 0.99
